@@ -21,6 +21,24 @@ namespace bufferization {
 struct OneShotBufferizationOptions;
 struct BufferizationStatistics;
 class OneShotAnalysisState;
+struct OpOperandPairInfo;
+
+/// Struct for caching visited uRead-uWrite pair.
+using OpOperandPair = std::pair<OpOperand *, OpOperand *>;
+
+struct OpOperandPairInfo : llvm::DenseMapInfo<OpOperandPair> {
+  static inline OpOperandPair getEmptyKey() { return {nullptr, nullptr}; }
+  static inline OpOperandPair getTombstoneKey() {
+    return {reinterpret_cast<OpOperand *>(-1),
+            reinterpret_cast<OpOperand *>(-1)};
+  }
+  static unsigned getHashValue(const OpOperandPair &val) {
+    return llvm::hash_combine(val.first, val.second);
+  }
+  static bool isEqual(const OpOperandPair &lhs, const OpOperandPair &rhs) {
+    return lhs == rhs;
+  }
+};
 
 /// Options for analysis-enabled bufferization.
 struct OneShotBufferizationOptions : public BufferizationOptions {

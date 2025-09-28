@@ -725,8 +725,24 @@ hasReadAfterWriteInterference(const DenseSet<OpOperand *> &usesRead,
       }
 
       // No conflict if the operands are non-conflicting subsets.
-      if (areNonConflictingSubsets(uRead, uConflictingWrite, state)) {
-        LDBG() << "  no conflict: non-conflicting subsets";
+      llvm::DenseMap<OpOperandPair, bool, OpOperandPairInfo> subsetCache;
+      OpOperandPair key{uRead, uConflictingWrite};
+      auto it = subsetCache.find(key);
+      bool isNonConflicting;
+      if (it != subsetCache.end()) {
+        isNonConflicting = it->second;
+#ifndef NDEBUG
+        assert(isNonConflicting ==
+                   areNonConflictingSubsets(uRead, uConflictingWrite, state) &&
+               "inconsistent areNonConflictingSubsets cache result");
+#endif // NDEBUG
+      } else {
+        isNonConflicting =
+            areNonConflictingSubsets(uRead, uConflictingWrite, state);
+        subsetCache[key] = isNonConflicting;
+      }
+      if (isNonConflicting) {
+        LLVM_DEBUG(llvm::dbgs() << "  no conflict: non-conflicting subsets\n");
         continue;
       }
 
