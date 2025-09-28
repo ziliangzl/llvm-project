@@ -45,6 +45,11 @@ struct AliasingOpOperand {
                     bool isDefinite = true)
       : opOperand(opOperand), relation(relation), isDefinite(isDefinite) {}
 
+  bool operator==(const AliasingOpOperand &other) const {
+    return opOperand == other.opOperand && relation == other.relation &&
+           isDefinite == other.isDefinite;
+  }
+
   OpOperand *opOperand;
   BufferRelation relation;
   bool isDefinite;
@@ -84,6 +89,10 @@ public:
 
   auto begin() const { return aliases.begin(); }
   auto end() const { return aliases.end(); }
+
+  bool operator==(const AliasList<T> &other) const {
+    return aliases == other.aliases;
+  }
 
 private:
   /// The list of aliases.

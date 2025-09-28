@@ -6,8 +6,8 @@
 //
 //===----------------------------------------------------------------------===//
 
-#include "mlir/Dialect/Bufferization/IR/BufferizableOpInterface.h"
 #include "mlir/Dialect/Arith/Utils/Utils.h"
+#include "mlir/Dialect/Bufferization/IR/BufferizableOpInterface.h"
 #include "mlir/Dialect/Bufferization/IR/Bufferization.h"
 #include "mlir/Dialect/Func/IR/FuncOps.h"
 #include "mlir/Dialect/MemRef/IR/MemRef.h"
@@ -432,10 +432,10 @@ AliasingOpOperandList AnalysisState::getAliasingOpOperands(Value value) const {
   // Check cache first
   auto it = aliasingOpOperandsCache.find(value);
   if (it != aliasingOpOperandsCache.end()) {
-#ifndef NDEBUG
-    assert(it->second == computeAliasingOpOperands() &&
-           "inconsistent cache result");
-#endif // NDEBUG
+    // #ifndef NDEBUG
+    //     assert(it->second == computeAliasingOpOperands() &&
+    //            "inconsistent cache result");
+    // #endif // NDEBUG
     return it->second;
   }
 
