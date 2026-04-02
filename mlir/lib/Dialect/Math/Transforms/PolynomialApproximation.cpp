@@ -1405,6 +1405,167 @@ ExpApproximation::matchAndRewrite(math::ExpOp op,
 } // namespace
 
 //----------------------------------------------------------------------------//
+// Exp2 approximation.
+//----------------------------------------------------------------------------//
+
+namespace {
+
+struct Exp2Approximation : public OpRewritePattern<math::Exp2Op> {
+public:
+  using OpRewritePattern::OpRewritePattern;
+
+  LogicalResult matchAndRewrite(math::Exp2Op op,
+                                PatternRewriter &rewriter) const final;
+};
+
+LogicalResult
+Exp2Approximation::matchAndRewrite(math::Exp2Op op,
+                                   PatternRewriter &rewriter) const {
+  auto shape = vectorShape(op.getOperand().getType());
+  auto elementTy = getElementTypeOrSelf(op.getType());
+  if (!elementTy.isF32() && !elementTy.isF16())
+    return rewriter.notifyMatchFailure(op, "unsupported operand type");
+
+  ImplicitLocOpBuilder builder(op->getLoc(), rewriter);
+
+  // Algorithm (same for f16 and f32, differing in polynomial degree and
+  // bit-manipulation constants):
+  //
+  //   2^x = poly(r) * 2^n
+  //
+  //   n    = round(x)       -- via floor(x + 0.5)
+  //   r    = x - n          -- fractional part in [-0.5, 0.5]
+  //   poly = minimax polynomial for 2^r over [-0.5, 0.5]
+  //   2^n  = bitcast((n + bias) << mantissaBits)
+
+  // ---- f16 native path (no promotion to f32) ----
+  if (elementTy.isF16()) {
+    auto bcast = [&](Value value) -> Value {
+      return broadcast(builder, value, shape);
+    };
+
+    auto i16 = builder.getIntegerType(16);
+    auto i16Vec = broadcast(i16, shape);
+    auto f16 = builder.getF16Type();
+
+    auto f16Cst = [&](float v) -> Value {
+      return bcast(floatCst(builder, v, f16));
+    };
+    auto i16Cst = [&](int16_t v) -> Value {
+      return bcast(arith::ConstantOp::create(
+          builder, builder.getIntegerAttr(i16, v)));
+    };
+
+    // Clamp x to the f16 representable exp2 range.
+    Value x = op.getOperand();
+    x = arith::MaxNumFOp::create(builder, x, f16Cst(-15.0f));
+    x = arith::MinNumFOp::create(builder, x, f16Cst(16.0f));
+
+    // n = round(x) via floor(x + 0.5), then clamp to [-15, 15].
+    // Clamping n ensures 2^n stays finite; the polynomial handles the
+    // remainder outside [-0.5, 0.5] via extrapolation.
+    Value nF = math::FloorOp::create(
+        builder, arith::AddFOp::create(builder, x, f16Cst(0.5f)));
+    nF = arith::MaxNumFOp::create(builder, nF, f16Cst(-15.0f));
+    nF = arith::MinNumFOp::create(builder, nF, f16Cst(15.0f));
+    Value nI = arith::FPToSIOp::create(builder, i16Vec, nF);
+
+    // r = x - n, r in [-0.5, 0.5].
+    Value r = arith::SubFOp::create(builder, x, nF);
+
+    // Degree-4 minimax polynomial for 2^r (coefficients from Taylor series
+    // of 2^r = e^(r*ln2), i.e. C_k = ln(2)^k / k!).
+    Value p = math::FmaOp::create(builder, r,
+                                  f16Cst(9.6187364e-3f),   // C4 = ln2^4/24
+                                  f16Cst(5.5504109e-2f));  // C3 = ln2^3/6
+    p = math::FmaOp::create(builder, r, p,
+                            f16Cst(2.4022651e-1f));        // C2 = ln2^2/2
+    p = math::FmaOp::create(builder, r, p,
+                            f16Cst(6.9314718e-1f));        // C1 = ln2
+    Value poly = math::FmaOp::create(builder, r, p,
+                                     f16Cst(1.0f));        // C0 = 1
+
+    // Construct 2^n via f16 bit manipulation.
+    // f16: 1 sign | 5 exponent (bias=15) | 10 mantissa.
+    Value pow2 = arith::BitcastOp::create(
+        builder, broadcast(f16, shape),
+        arith::ShLIOp::create(
+            builder, arith::AddIOp::create(builder, nI, i16Cst(15)),
+            i16Cst(10)));
+
+    rewriter.replaceOp(op, arith::MulFOp::create(builder, poly, pow2));
+    return success();
+  }
+
+  // ---- f32 path ----
+  auto bcast = [&](Value value) -> Value {
+    return broadcast(builder, value, shape);
+  };
+
+  // NaN-preserving clamp using UGE/ULE (unlike MaxNumFOp which strips NaN).
+  // This matches the technique in ExpApproximation::clampWithNormals.
+  auto clampNanPreserving = [&](Value v, float lo, float hi) -> Value {
+    auto sel = [&](auto pred, Value val, Value bound) {
+      return arith::SelectOp::create(
+          builder, arith::CmpFOp::create(builder, pred, val, bound), val,
+          bound);
+    };
+    v = sel(arith::CmpFPredicate::UGE, v, bcast(f32Cst(builder, lo)));
+    v = sel(arith::CmpFPredicate::ULE, v, bcast(f32Cst(builder, hi)));
+    return v;
+  };
+
+  // Clamp x to the f32 representable exp2 range. The upper bound 129
+  // (beyond 2^128 = +inf) ensures that +inf is clamped high enough for the
+  // polynomial extrapolation to overflow the final mulf to +inf.
+  Value x = op.getOperand();
+  x = clampNanPreserving(x, -127.0f, 129.0f);
+
+  // n = round(x) via floor(x + 0.5), then clamp to [-127, 127].
+  // Clamping n ensures 2^n stays finite; the polynomial handles the
+  // remainder outside [-0.5, 0.5] via extrapolation (see ExpApproximation).
+  Value cstHalf = bcast(f32Cst(builder, 0.5f));
+  Value nF = math::FloorOp::create(
+      builder, arith::AddFOp::create(builder, x, cstHalf));
+  nF = clampNanPreserving(nF, -127.0f, 127.0f);
+  Value nI = arith::FPToSIOp::create(
+      builder, broadcast(builder.getI32Type(), shape), nF);
+
+  // r = x - n, r in [-0.5, 0.5].
+  Value r = arith::SubFOp::create(builder, x, nF);
+
+  // Degree-6 Cephes minimax polynomial for 2^r over [-0.5, 0.5].
+  Value p = math::FmaOp::create(
+      builder, r,
+      bcast(f32Cst(builder, 1.5353361883e-4f)),   // C6
+      bcast(f32Cst(builder, 1.3398874403e-3f)));   // C5
+  p = math::FmaOp::create(builder, r, p,
+      bcast(f32Cst(builder, 9.6184373577e-3f)));   // C4
+  p = math::FmaOp::create(builder, r, p,
+      bcast(f32Cst(builder, 5.5503324712e-2f)));   // C3
+  p = math::FmaOp::create(builder, r, p,
+      bcast(f32Cst(builder, 2.4022647914e-1f)));   // C2
+  p = math::FmaOp::create(builder, r, p,
+      bcast(f32Cst(builder, 6.9314720286e-1f)));   // C1
+  Value poly = math::FmaOp::create(builder, r, p,
+      bcast(f32Cst(builder, 1.0f)));               // C0
+
+  // Construct 2^n via f32 bit manipulation.
+  // f32: 1 sign | 8 exponent (bias=127) | 23 mantissa.
+  Value pow2 = arith::BitcastOp::create(
+      builder, broadcast(builder.getF32Type(), shape),
+      arith::ShLIOp::create(
+          builder,
+          arith::AddIOp::create(builder, nI, bcast(i32Cst(builder, 127))),
+          bcast(i32Cst(builder, 23))));
+
+  rewriter.replaceOp(op, arith::MulFOp::create(builder, poly, pow2));
+  return success();
+}
+
+} // namespace
+
+//----------------------------------------------------------------------------//
 // ExpM1 approximation.
 //----------------------------------------------------------------------------//
 
@@ -1855,6 +2016,8 @@ void mlir::populateMathPolynomialApproximationPatterns(
       patterns, predicate, benefit);
   populateMathPolynomialApproximationPattern<ExpOp, ExpApproximation>(
       patterns, predicate, benefit);
+  populateMathPolynomialApproximationPattern<Exp2Op, Exp2Approximation>(
+      patterns, predicate, benefit);
   populateMathPolynomialApproximationPattern<ExpM1Op, ExpM1Approximation>(
       patterns, predicate, benefit);
   populateMathPolynomialApproximationPattern<LogOp, LogApproximation>(
@@ -1881,9 +2044,9 @@ void mlir::populateMathPolynomialApproximationPatterns(
          math::TanhOp::getOperationName(), math::LogOp::getOperationName(),
          math::Log2Op::getOperationName(), math::Log1pOp::getOperationName(),
          math::ErfOp::getOperationName(), math::ErfcOp::getOperationName(),
-         math::ExpOp::getOperationName(), math::ExpM1Op::getOperationName(),
-         math::CbrtOp::getOperationName(), math::SinOp::getOperationName(),
-         math::CosOp::getOperationName()},
+         math::ExpOp::getOperationName(), math::Exp2Op::getOperationName(),
+         math::ExpM1Op::getOperationName(), math::CbrtOp::getOperationName(),
+         math::SinOp::getOperationName(), math::CosOp::getOperationName()},
         name);
   });
 
@@ -1897,6 +2060,7 @@ void mlir::populateMathPolynomialApproximationPatterns(
              math::Log1pOp::getOperationName(), math::ErfOp::getOperationName(),
              math::ErfcOp::getOperationName(), math::AsinOp::getOperationName(),
              math::AcosOp::getOperationName(), math::ExpOp::getOperationName(),
+             math::Exp2Op::getOperationName(),
              math::ExpM1Op::getOperationName(),
              math::CbrtOp::getOperationName(), math::SinOp::getOperationName(),
              math::CosOp::getOperationName()},

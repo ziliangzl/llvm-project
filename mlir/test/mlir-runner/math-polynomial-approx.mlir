@@ -392,6 +392,57 @@ func.func @exp() {
   return
 }
 
+// -------------------------------------------------------------------------- //
+// Exp2.
+// -------------------------------------------------------------------------- //
+func.func @exp2_f32(%a : f32) {
+  %r = math.exp2 %a : f32
+  vector.print %r : f32
+  return
+}
+
+func.func @exp2_4xf32(%a : vector<4xf32>) {
+  %r = math.exp2 %a : vector<4xf32>
+  vector.print %r : vector<4xf32>
+  return
+}
+
+func.func @exp2() {
+  // CHECK: 1
+  %zero = arith.constant 0.0 : f32
+  call @exp2_f32(%zero) : (f32) -> ()
+
+  // CHECK: 2
+  %one = arith.constant 1.0 : f32
+  call @exp2_f32(%one) : (f32) -> ()
+
+  // CHECK: 0.5
+  %neg_one = arith.constant -1.0 : f32
+  call @exp2_f32(%neg_one) : (f32) -> ()
+
+  // CHECK: 0.707107, 1.68179, 2, 11.3137
+  %v1 = arith.constant dense<[-0.5, 0.75, 1.0, 3.5]> : vector<4xf32>
+  call @exp2_4xf32(%v1) : (vector<4xf32>) -> ()
+
+  // CHECK: 0, 2.98023e-08, 3.35544e+07, inf
+  %special_vec = arith.constant dense<[-150.0, -25.0, 25.0, 129.0]> : vector<4xf32>
+  call @exp2_4xf32(%special_vec) : (vector<4xf32>) -> ()
+
+  // CHECK: inf
+  %inf = arith.constant 0x7f800000 : f32
+  call @exp2_f32(%inf) : (f32) -> ()
+
+  // CHECK: 0
+  %negative_inf = arith.constant 0xff800000 : f32
+  call @exp2_f32(%negative_inf) : (f32) -> ()
+
+  // CHECK: nan
+  %nan = arith.constant 0x7fc00000 : f32
+  call @exp2_f32(%nan) : (f32) -> ()
+
+  return
+}
+
 func.func @expm1_f32(%a : f32) {
   %r = math.expm1 %a : f32
   vector.print %r : f32
@@ -846,6 +897,7 @@ func.func @main() {
   call @erf(): () -> ()
   call @erfc(): () -> ()
   call @exp(): () -> ()
+  call @exp2(): () -> ()
   call @expm1(): () -> ()
   call @sin(): () -> ()
   call @cos(): () -> ()

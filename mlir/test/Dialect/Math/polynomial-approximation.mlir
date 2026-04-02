@@ -286,6 +286,91 @@ func.func @exp_scalable_vector(%arg0: vector<[8]xf32>) -> vector<[8]xf32> {
   return %0 : vector<[8]xf32>
 }
 
+// CHECK-LABEL:   func @exp2_scalar(
+// CHECK-SAME:      %[[X:.*]]: f32) -> f32 {
+// CHECK-DAG:       %[[HALF:.*]] = arith.constant 5.000000e-01 : f32
+// CHECK-DAG:       %[[C1:.*]] = arith.constant 0.693147182 : f32
+// CHECK-DAG:       %[[C2:.*]] = arith.constant 0.240226477 : f32
+// CHECK-DAG:       %[[C3:.*]] = arith.constant 0.0555033237 : f32
+// CHECK-DAG:       %[[C4:.*]] = arith.constant 0.00961843691 : f32
+// CHECK-DAG:       %[[C5:.*]] = arith.constant 0.00133988739 : f32
+// CHECK-DAG:       %[[C6:.*]] = arith.constant 1.5353362E-4 : f32
+// CHECK-DAG:       %[[ONE:.*]] = arith.constant 1.000000e+00 : f32
+// CHECK-DAG:       %[[LOWER:.*]] = arith.constant -1.270000e+02 : f32
+// CHECK-DAG:       %[[UPPER:.*]] = arith.constant 1.290000e+02 : f32
+// CHECK-DAG:       %[[NMAX:.*]] = arith.constant 1.270000e+02 : f32
+// CHECK-DAG:       %[[BIAS:.*]] = arith.constant 127 : i32
+// CHECK-DAG:       %[[MANTISSA:.*]] = arith.constant 23 : i32
+// CHECK:           %[[CMP1:.*]] = arith.cmpf uge, %[[X]], %[[LOWER]] : f32
+// CHECK:           %[[SEL1:.*]] = arith.select %[[CMP1]], %[[X]], %[[LOWER]] : f32
+// CHECK:           %[[CMP2:.*]] = arith.cmpf ule, %[[SEL1]], %[[UPPER]] : f32
+// CHECK:           %[[CLAMPED:.*]] = arith.select %[[CMP2]], %[[SEL1]], %[[UPPER]] : f32
+// CHECK:           %[[XHALF:.*]] = arith.addf %[[CLAMPED]], %[[HALF]] : f32
+// CHECK:           %[[N0:.*]] = math.floor %[[XHALF]] : f32
+// CHECK:           %[[CMP3:.*]] = arith.cmpf uge, %[[N0]], %[[LOWER]] : f32
+// CHECK:           %[[SEL3:.*]] = arith.select %[[CMP3]], %[[N0]], %[[LOWER]] : f32
+// CHECK:           %[[CMP4:.*]] = arith.cmpf ule, %[[SEL3]], %[[NMAX]] : f32
+// CHECK:           %[[N:.*]] = arith.select %[[CMP4]], %[[SEL3]], %[[NMAX]] : f32
+// CHECK:           %[[NI:.*]] = arith.fptosi %[[N]] : f32 to i32
+// CHECK:           %[[R:.*]] = arith.subf %[[CLAMPED]], %[[N]] : f32
+// CHECK:           %[[P0:.*]] = math.fma %[[R]], %[[C6]], %[[C5]] : f32
+// CHECK:           %[[P1:.*]] = math.fma %[[R]], %[[P0]], %[[C4]] : f32
+// CHECK:           %[[P2:.*]] = math.fma %[[R]], %[[P1]], %[[C3]] : f32
+// CHECK:           %[[P3:.*]] = math.fma %[[R]], %[[P2]], %[[C2]] : f32
+// CHECK:           %[[P4:.*]] = math.fma %[[R]], %[[P3]], %[[C1]] : f32
+// CHECK:           %[[POLY:.*]] = math.fma %[[R]], %[[P4]], %[[ONE]] : f32
+// CHECK:           %[[BIASED:.*]] = arith.addi %[[NI]], %[[BIAS]] : i32
+// CHECK:           %[[BITS:.*]] = arith.shli %[[BIASED]], %[[MANTISSA]] : i32
+// CHECK:           %[[POW2:.*]] = arith.bitcast %[[BITS]] : i32 to f32
+// CHECK:           %[[RES:.*]] = arith.mulf %[[POLY]], %[[POW2]] : f32
+// CHECK:           return %[[RES]] : f32
+func.func @exp2_scalar(%arg0: f32) -> f32 {
+  %0 = math.exp2 %arg0 : f32
+  return %0 : f32
+}
+
+// CHECK-LABEL:   func @exp2_vector(
+// CHECK-SAME:      %[[VAL_0:.*]]: vector<8xf32>) -> vector<8xf32> {
+// CHECK-NOT:   math.exp2
+func.func @exp2_vector(%arg0: vector<8xf32>) -> vector<8xf32> {
+  %0 = math.exp2 %arg0 : vector<8xf32>
+  return %0 : vector<8xf32>
+}
+
+// CHECK-LABEL:   func @exp2_scalable_vector
+// CHECK-NOT:      math.exp2
+func.func @exp2_scalable_vector(%arg0: vector<[8]xf32>) -> vector<[8]xf32> {
+  %0 = math.exp2 %arg0 : vector<[8]xf32>
+  return %0 : vector<[8]xf32>
+}
+
+// With the legacy test pass, f16 goes through ReuseF32Expansion (extf->f32
+// polynomial->truncf). The native f16 path fires when only
+// populateMathPolynomialApproximationPatterns is used.
+// CHECK-LABEL:   func @exp2_f16(
+// CHECK-NOT:      math.exp2
+// CHECK:          arith.extf {{.*}} : f16 to f32
+// CHECK:          arith.cmpf uge, {{.*}} : f32
+// CHECK:          arith.select {{.*}} : f32
+// CHECK:          arith.cmpf ule, {{.*}} : f32
+// CHECK:          arith.select {{.*}} : f32
+// CHECK:          math.floor {{.*}} : f32
+// CHECK-COUNT-6:  math.fma {{.*}} : f32
+// CHECK:          arith.bitcast {{.*}} : i32 to f32
+// CHECK:          arith.mulf {{.*}} : f32
+// CHECK:          arith.truncf {{.*}} : f32 to f16
+func.func @exp2_f16(%arg0: f16) -> f16 {
+  %0 = math.exp2 %arg0 : f16
+  return %0 : f16
+}
+
+// CHECK-LABEL:   func @exp2_f16_vector(
+// CHECK-NOT:      math.exp2
+func.func @exp2_f16_vector(%arg0: vector<4xf16>) -> vector<4xf16> {
+  %0 = math.exp2 %arg0 : vector<4xf16>
+  return %0 : vector<4xf16>
+}
+
 // CHECK-LABEL:   func @expm1_scalar(
 // CHECK-SAME:                       %[[X:.*]]: f32) -> f32 {
 // CHECK-DAG:       %[[VAL_1:.*]] = arith.constant 1.000000e+00 : f32
@@ -989,8 +1074,11 @@ func.func @math_f16(%arg0 : vector<4xf16>) -> vector<4xf16> {
   // CHECK-NOT: math.exp
   %7 = "math.exp"(%6) : (vector<4xf16>) -> vector<4xf16>
 
+  // CHECK-NOT: math.exp2
+  %100 = "math.exp2"(%7) : (vector<4xf16>) -> vector<4xf16>
+
   // CHECK-NOT: math.expm1
-  %8 = "math.expm1"(%7) : (vector<4xf16>) -> vector<4xf16>
+  %8 = "math.expm1"(%100) : (vector<4xf16>) -> vector<4xf16>
 
   // CHECK-NOT: math.cbrt
   %9 = "math.cbrt"(%8) : (vector<4xf16>) -> vector<4xf16>
@@ -1031,8 +1119,11 @@ func.func @math_zero_rank(%arg0 : vector<f16>) -> vector<f16> {
   // CHECK-NOT: math.exp
   %7 = "math.exp"(%6) : (vector<f16>) -> vector<f16>
 
+  // CHECK-NOT: math.exp2
+  %200 = "math.exp2"(%7) : (vector<f16>) -> vector<f16>
+
   // CHECK-NOT: math.expm1
-  %8 = "math.expm1"(%7) : (vector<f16>) -> vector<f16>
+  %8 = "math.expm1"(%200) : (vector<f16>) -> vector<f16>
 
   // CHECK-NOT: math.cbrt
   %9 = "math.cbrt"(%8) : (vector<f16>) -> vector<f16>
