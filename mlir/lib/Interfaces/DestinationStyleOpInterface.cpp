@@ -35,9 +35,10 @@ LogicalResult detail::verifyDestinationStyleOpInterface(Operation *op) {
     Type type = operand.get().getType();
     if (isa<TensorType>(type)) {
       outputTensorOperands.push_back(&operand);
-    } else if (!isa<BaseMemRefType>(type)) {
+    } else if (!detail::isDestinationStyleBufferLikeType(type)) {
       return op->emitOpError("expected that operand #")
-             << operand.getOperandNumber() << " is a tensor or a memref";
+             << operand.getOperandNumber()
+             << " is a tensor or a buffer-like type";
     }
   }
 

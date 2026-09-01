@@ -145,11 +145,13 @@ def DestinationStyleOpInterface : OpInterface<"DestinationStyleOpInterface"> {
     }
 
     /// Return "true" if `opOperand` is a scalar value. A sclar is defined as
-    /// neither a MemRef nor a tensor value.
+    /// neither a buffer-like value (memref, or a dialect type that opts in
+    /// via ShapedTypeInterface) nor a tensor value.
     bool isScalar(::mlir::OpOperand *opOperand) {
       assert(opOperand->getOwner() == $_op && "invalid operand");
-      return !::llvm::isa<BaseMemRefType, TensorType>(
-          opOperand->get().getType());
+      ::mlir::Type type = opOperand->get().getType();
+      return !::llvm::isa<TensorType>(type) &&
+             !::mlir::detail::isDestinationStyleBufferLikeType(type);
     }
 
     /// Return the OpResult that is tied to the given OpOperand.
@@ -171,7 +173,8 @@ def DestinationStyleOpInterface : OpInterface<"DestinationStyleOpInterface"> {
     }
 
     /// Return whether the op has pure buffer semantics. That is the case if the
-    /// op has no tensor operands and at least one memref operand.
+    /// op has no tensor operands and at least one buffer-like operand (a
+    /// memref, or a dialect type that opts in via ShapedTypeInterface).
     bool hasPureBufferSemantics() {
       // No tensors.
       auto isTensor = [](Value v){
@@ -179,21 +182,21 @@ def DestinationStyleOpInterface : OpInterface<"DestinationStyleOpInterface"> {
       };
       if (::llvm::any_of($_op->getOperands(), isTensor))
         return false;
-      // At least one memref.
-      auto isMemref = [](Value v){
-        return ::llvm::isa<::mlir::BaseMemRefType>(v.getType());
+      // At least one buffer-like operand.
+      auto isBufferLike = [](Value v){
+        return ::mlir::detail::isDestinationStyleBufferLikeType(v.getType());
       };
-      return llvm::any_of($_op->getOperands(), isMemref);
+      return llvm::any_of($_op->getOperands(), isBufferLike);
     }
 
     /// Return whether the op has pure tensor semantics. That is the case if the
-    /// op has no memref operands and at least one tensor operand.
+    /// op has no buffer-like operands and at least one tensor operand.
     bool hasPureTensorSemantics() {
-      // No memrefs.
-      auto isMemref = [](Value v){
-        return ::llvm::isa<::mlir::BaseMemRefType>(v.getType());
+      // No buffer-like operands.
+      auto isBufferLike = [](Value v){
+        return ::mlir::detail::isDestinationStyleBufferLikeType(v.getType());
       };
-      if (::llvm::any_of($_op->getOperands(), isMemref))
+      if (::llvm::any_of($_op->getOperands(), isBufferLike))
         return false;
       // At least one tensor.
       auto isTensor = [](Value v){

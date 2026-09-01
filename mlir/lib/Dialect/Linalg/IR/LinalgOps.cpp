@@ -150,8 +150,11 @@ static void fillStructuredOpRegion(OpBuilder &opBuilder, Region &region,
   SmallVector<Location, 8> argLocs;
   for (auto containers : {inputTypes, outputTypes}) {
     for (auto t : containers) {
-      argTypes.push_back(
-          isa<MemRefType, RankedTensorType>(t) ? getElementTypeOrSelf(t) : t);
+      // Any shaped container (memref, tensor, or a dialect type that opts
+      // in via ShapedTypeInterface) contributes its element type as the
+      // block argument; anything else (e.g. an already-scalar type) is
+      // passed through as-is.
+      argTypes.push_back(isa<ShapedType>(t) ? getElementTypeOrSelf(t) : t);
 
       // TODO: Pass in a proper location here.
       argLocs.push_back(opBuilder.getUnknownLoc());
@@ -1131,8 +1134,8 @@ static void buildGenericRegion(
   for (ValueRange container : {inputs, outputs}) {
     for (Value v : container) {
       Type t = v.getType();
-      blockArgTypes.push_back(
-          isa<MemRefType, RankedTensorType>(t) ? getElementTypeOrSelf(t) : t);
+      blockArgTypes.push_back(isa<ShapedType>(t) ? getElementTypeOrSelf(t)
+                                                  : t);
       blockArgLocs.push_back(v.getLoc());
     }
   }
@@ -1355,7 +1358,7 @@ static void getGenericEffectsImpl(
         &effects,
     LinalgOp linalgOp) {
   for (auto [index, operand] : llvm::enumerate(linalgOp.getDpsInputs())) {
-    if (!llvm::isa<MemRefType>(operand.getType()))
+    if (!::mlir::detail::isDestinationStyleBufferLikeType(operand.getType()))
       continue;
     effects.emplace_back(
         MemoryEffects::Read::get(), &linalgOp->getOpOperand(index), /*stage=*/0,
@@ -1363,7 +1366,7 @@ static void getGenericEffectsImpl(
   }
 
   for (OpOperand &operand : linalgOp.getDpsInitsMutable()) {
-    if (!llvm::isa<MemRefType>(operand.get().getType()))
+    if (!::mlir::detail::isDestinationStyleBufferLikeType(operand.get().getType()))
       continue;
     if (linalgOp.payloadUsesValueFromOperand(&operand)) {
       effects.emplace_back(MemoryEffects::Read::get(), &operand, /*stage=*/0,
@@ -2523,7 +2526,7 @@ static LogicalResult verifyYield(linalg::YieldOp op, LinalgOp linalgOp) {
     OpOperand *outputOperand =
         linalgOp.getDpsInitOperand(opOperand.getOperandNumber());
     Type elementType = outputOperand->get().getType();
-    if (isa<MemRefType, RankedTensorType>(elementType))
+    if (isa<ShapedType>(elementType))
       elementType = getElementTypeOrSelf(outputOperand->get().getType());
     if (opOperand.get().getType() != elementType)
       return op.emitOpError("type of yield operand ")

@@ -1378,7 +1378,7 @@ LogicalResult mlir::linalg::detail::verifyStructuredOpInterface(Operation *op) {
 
   for (OpOperand *opOperand : linalgOp.getOpOperandsMatchingBBargs()) {
     Type elementType = opOperand->get().getType();
-    if (isa<MemRefType, RankedTensorType>(elementType))
+    if (isa<ShapedType>(elementType))
       elementType = getElementTypeOrSelf(opOperand->get().getType());
     Type argType = block.getArgument(opOperand->getOperandNumber()).getType();
     if (elementType != argType)

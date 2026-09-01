@@ -41,7 +41,12 @@ static LogicalResult verifyIndexingMapOperandType(Operation *op, Type t,
   if (isa<RankedTensorType>(t))
     return success();
 
-  // Any other shaped type is not supported by this interface.
+  // Any other ranked shaped type is accepted too -- e.g. a dialect-defined
+  // "descriptor" type for a non-builtin memory space that opts in via
+  // ShapedTypeInterface, playing the same role a memref does here.
+  if (cast<ShapedType>(t).hasRank())
+    return success();
+
   return op->emitOpError("operand #")
          << operandNumber
          << " must be ranked tensor/memref, vector, or scalar, but got " << t;

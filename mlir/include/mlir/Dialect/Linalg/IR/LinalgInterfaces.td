@@ -383,11 +383,11 @@ def LinalgStructuredInterface
         // A VectorType is an elemental type, do not consider its rank for the operand.
         if (isa<VectorType>(t))
           return 0;
-        // Tensor and Memref container types have a rank.
+        // Tensor and Memref container types (or any other type opting in via
+        // ShapedTypeInterface) have a rank.
         if (auto shapedType = ::llvm::dyn_cast<ShapedType>(t)) {
-          // Failsafe.
-          assert((isa<MemRefType>(t) || isa<RankedTensorType>(t)) &&
-                 "expected a ranked tensor or memref in LinalgInterface::getRank");
+          assert(shapedType.hasRank() &&
+                 "expected a ranked shaped type in LinalgInterface::getRank");
           return shapedType.getRank();
         }
         return 0;
@@ -703,9 +703,8 @@ def LinalgStructuredInterface
         if (isa<VectorType>(t))
           return {};
         if (auto shapedType = ::llvm::dyn_cast<ShapedType>(t)) {
-          // Failsafe.
-          assert((isa<MemRefType>(t) || isa<RankedTensorType>(t)) &&
-                 "expected a ranked tensor or memref in LinalgInterface::getRank");
+          assert(shapedType.hasRank() &&
+                 "expected a ranked shaped type in LinalgInterface::getShape");
           return shapedType.getShape();
         }
         return {};
