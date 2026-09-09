@@ -28,6 +28,8 @@
 
 | 问题                                                            | 结论                                                                                            | 依据                        |
 | --------------------------------------------------------------- | ----------------------------------------------------------------------------------------------- | --------------------------- |
+| 本 pass 是否创建 `alloc_tensor`                                 | **不创建**：allocation root 由 `MaterializeTensorStorage`（设计文档 §3.2 第 6 步）产出，本 pass 只 move + 穿 iter_args，进出数量 1:1 | §7.0                        |
+| 要不要完整的 read-after-write 冲突分析                          | 不要：只沿 DPS destination chain 做一次线性性检查（O(链长)）；漏判由 G4 兜底，只有 G7/G8 必须自己保证 | §7.0、§7.3.1                |
 | 例子从哪来                                                      | 上游 `transform-tile-and-fuse.mlir` 的 fill→matmul→generic 结构，改成全静态 shape + `scf.for` | §2                          |
 | before 里有几个循环内 allocation                                | 5 个 `alloc_tensor`（bias / A tile / B tile / acc / out tile），bufferize 后 5 个循环内 `memref.alloc` | 实测 H1                     |
 | after 期望形态                                                  | 5 个 `alloc_tensor` 提到最外层 loop 之前，穿过**两层** `iter_args`，body 末尾 yield 各自最新版本 | §5                          |
@@ -269,7 +271,7 @@ func.func @fused_matmul_relu(%arg0: tensor<128x256xf32>, %arg1: tensor<256x64xf3
 | 1. alloc 移到 `hoistPoint(a)` | 5 个 `alloc_tensor` 移到最外层 `scf.for` 之前（两层 loop 都会重复执行它们） |
 | 2. 每层 loop 加 iter_arg        | 外层 + 内层各加 5 个，顺序与 slot 编号一致                                     |
 | 3. body 内第一次写改写 iter_arg | 3 个 `materialize` 的 dest 换成 `%sb1/%sa1/%sw1`；`fill`/`generic` 的 outs 换成 `%sacc1/%so1` |
-| 4. 最后版本 yield 回同一位置    | `%bias_v, %a_v, %b_v, %mm, %g`；注意 slot4 走的是 `fill → matmul` 两跳     |
+| 3b. 终端版本 yield 回同一位置   | `%bias_v, %a_v, %b_v, %mm, %g`；注意 slot4 走的是 `fill → matmul` 两跳     |
 
 **实测 H2**（`-one-shot-bufferize`）：
 
@@ -363,6 +365,32 @@ body 直接用循环外的 `%bias_l1` 等作为 destination。结果与 H2 **完
 
 ## 7. 实现方案
 
+### 7.0 前置结论：本 pass 不创建 allocation
+
+**HoistOnly 不负责创建 `alloc_tensor`。** allocation root 由 `MaterializeTensorStorage(T)` 产出
+（设计文档 §3.2 第 6 步；参照实现 `LinalgTransformOps.cpp:460-491`：一个被 promote 的 value 对应一个
+`alloc_tensor`，再按 `mayBeRead` 决定是否插 `materialize_in_destination`，最后 `replaceAllUsesExcept`）。
+连设计文档 §3.6 表里 A5 的 `tensor.empty` 也是先由 `-empty-tensor-to-alloc-tensor` 转成 `alloc_tensor`、
+**之后**才走 §5.7 hoist。本文 §3 的 before IR 里 5 个 `alloc_tensor` 已经就位。
+
+所以本 pass 只做两件事：**把已有的 alloc 搬位置** + **穿 iter_args**。写成硬不变量：
+
+```text
+G6. #alloc_tensor(输出) == #alloc_tensor(输入)，且是同一批 op
+    （只 move，不 create / erase / merge / split）
+```
+
+这条不变量决定了本 pass **不需要**完整的 read-after-write conflict 分析——「几份 alloc」的两个决定
+都不在这里：
+
+| 决定                                | 归属                         | 依据                                              |
+| ----------------------------------- | ---------------------------- | ------------------------------------------------- |
+| 一共几个 allocation root            | `MaterializeTensorStorage` | 按被 promote 的 destination 数，1:1               |
+| 每个 root 几份（`slotCount` 1 / 2）  | `PlanPipeline`             | §4.6，依据是 stage 重叠（调度问题），不是冲突分析 |
+
+本 pass 自己需要的分析只有一条，而且是退化版：**沿 DPS destination chain 走一遍，确认它线性、并取终端值**
+（因为要知道 yield 谁）。复杂度 O(链长)，不需要 alias、不需要全局 liveness、不需要跨 root 的干涉图。
+
 ### 7.1 pass 的位置与名字
 
 ```text
@@ -385,14 +413,14 @@ HoistLoopAllocs(func):
       if A empty: continue
 
       for a in A:
-          // 1. 前置检查
-          assert a.getType().hasStaticShape()                        // V9，由尾块规范化保证
-          assert a 的 dynamic operand 为空                            // 否则不能提
-          P = outermostRepetitiveAncestor(a)                          // §5.2
+          // 1. 前置检查（任一条不满足就报错退出，清单见 §7.2.2）
+          require a.getType().hasStaticShape() 且 a 无 dynamic operand      // V9
+          P = hoistPoint(a)                                                // §5.2 + §7.2.1 的白名单
           // 2. 版本链：从 a 出发，沿 DPS destination 一路走到最后一个写
           chain = versionChain(a)      // a -> materialize/fill/matmul/... -> last
-          assert chain 的每一步都是 DestinationStyleOpInterface 且 dest 是上一步的 result
-          assert firstWrite(chain) 整块覆写 a                          // §5.7 第 4 条；不满足则报错并提示按 A3 处理
+          require chain 每一跳都是 DestinationStyleOpInterface 且 dest 是上一跳的 result
+          require a 与 chain 上每个中间 version 都只有一个 use，且该 use 是 DPS-init use
+          if 首次写不是整块覆写(chain): warn "疑似 A3 accumulator"          // 不报错，见 §7.2.3
       // 3. 一次性把 A 里所有 alloc 移到 P 之前，然后自内向外给每层 loop 加 iter_arg
       move all a in A to just before P
       for M in loops(from L up to P, inner -> outer):
@@ -400,24 +428,69 @@ HoistLoopAllocs(func):
                  rewriter,
                  /*newInitOperands=*/ A 的当前版本值,
                  /*replaceInitOperandUsesInLoop=*/ true,      // 关键：body 内对 a 的 use 自动换成 bbArg
-                 /*newYieldValuesFn=*/ [](bbArgs) { return lastVersion(bbArg) for each })
+                 /*newYieldValuesFn=*/ [](bbArgs) { return versionChain(bbArg).back() for each })
 ```
 
-要点：
+#### 7.2.1 `hoistPoint` 必须走白名单，不能直接反复外推（安全条件）
+
+`bufferization::getEnclosingRepetitiveRegion`（`BufferizableOpInterface.h:564`）**把 `scf.forall`
+也算成 repetitive region**（`SCF/Transforms/BufferizableOpInterfaceImpl.cpp:106-113`，
+`ForallOpInterface::isRepetitiveRegion` 只看 step 数）。盲目拿它反复外推 → alloc 被提到 `forall`
+之外 → **所有并发迭代共享同一份 L1 buffer = data race**。而且这个错误是**静默**的：
+
+- bufferize 不报错（形态完全合法）；
+- §7.3 的 G4 也数不出来（循环内确实 0 alloc）。
+
+设计文档 §3.7 只禁止了「本层 tiling 产出 `scf.forall`」，并不能假设 hoist 路径上没有别人产的
+`scf.forall`。所以实现必须显式白名单：
+
+```text
+hoistPoint(a):
+  last = null; cur = a 的 parent op
+  while cur 是 scf.for 或 scf.if:        // 只跨这两种
+      last = cur; cur = cur 的 parent op
+  若 cur 是 scf.forall / scf.while / 其他 repetitive region owner：停在它里面，
+    此时 a 仍在 repetitive region 内（G1 不满足）→ 报错，绝不静默外推
+  return last 之前的插入点
+```
+
+`outermostRepetitiveAncestor` 的语义仍然是 §5.2 那一条，只是实现不能偷懒。v0 若采用 static planner
+的简化版（一路提到 func entry block）也一样要过白名单检查，并保留 `hoistPoint` 的接口，
+别把 entry block 写死。
+
+#### 7.2.2 两种 def-use 分叉，性质完全不同
+
+| 分叉形式                                                            | 例子                                                              | 处理                                                                                                                                                              |
+| ------------------------------------------------------------------- | ----------------------------------------------------------------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| **读分叉**：同一个 version 被多个 op 当 `ins`                     | `%v` 同时喂 `matmul` 和 `generic`                             | **无害**：一份 alloc、一条链、终端就是 `%v`。这正是 `promote_tensor` 的 `replaceAllUsesExcept` 天然产出的形态                                                 |
+| **destination 分叉**：同一个 version 被两个 DPS op 当 `outs`      | `%f = fill outs(%a)` 与 `%g = generic outs(%a)`                | **tensor 程序本身就需要两份 buffer**，不是「hoist 变复杂了」。本 pass 报错退出；真正的修法在上游：`MaterializeTensorStorage` 应按 **destination use** promote，而不是按 value promote |
+| **覆写后的迟到 read**：中间 version 被下一跳覆写之后仍被读          | `%f = fill outs(%a)`、`%mm = matmul outs(%f)`，之后再读 `%f` | 与 destination 分叉一起，按「中间 version 的 use 数不等于 1」挡掉。保守（顺序上位于写之前的 read 其实合法），但覆盖 tiling 能产出的所有形态                       |
+
+> 输入例子（§2.2）里 `%D` 本来就同时是 `linalg.fill` 和 `linalg.generic` 的 `outs`——只是
+> tile-and-fuse 恰好给了两个不同的 `extract_slice`，才没有在 tile 层面撞上 destination 分叉。
+> 换一个 fusion 决策就会撞上，所以这条检查不是理论洁癖。
+
+#### 7.2.3 「整块覆写」是诊断，不是正确性 gate
+
+设计文档 §5.7 第 4 条要求「a 在每次迭代开始时都被完整覆写」。**这条不影响正确性**：`alloc_tensor`
+的内容是 undefined，读它是 UB；hoist + iter_args threading 把「上一迭代的残留」穿进来，是对 UB 的
+合法 refine——即使 slot 不是整块覆写，程序含义也没变。
+
+它的真实作用是**探测上游的分类错误**：非整块覆写的 slot 大概率是设计文档 §3.4 的 A3 accumulator，
+`fill` 应该被提到循环外、iter_arg 承载的应该是真实内容。所以实现里它是 **warning（或 opt-in error）**，
+不是 `assert`——否则会在完全合法的 IR 上硬失败。
+
+#### 7.2.4 其余要点
 
 - **`replaceInitOperandUsesInLoop = true`** 正好实现 §5.7 的第 3 步：把 body 内对 alloc 的所有 use
   换成新加的 region iter_arg，不需要自己做 RAUW
   （`LoopLikeInterface.td:229-238`，`scf::ForOp` 的实现在 `SCF.cpp:627`）。
-- `newYieldValuesFn` 里返回的是 `versionChain` 的末端值（本例 slot4 是 `%mm` 而不是 `%f`）。
+- `newYieldValuesFn` 里返回的是 `versionChain` 的**终端**值（本例 slot4 是 `%mm` 而不是 `%f`）。
   版本链的走法：`用户是 DestinationStyleOpInterface 且该 operand 属于 getDpsInits()` → 取对应 result → 重复。
   `bufferization.materialize_in_destination` 也实现 `DestinationStyleOpInterface`
   （`BufferizationOps.td`），所以 copy 和 compute 用同一套代码走链。
 - 多层时**先给内层加、再给外层加**：外层 `newInitOperands` 用的是外层 bbArg，内层 loop 的 init 换成它。
   实现上更简单的写法是自内向外逐层调用 `replaceWithAdditionalYields`，每层的 init 用上一层暴露出来的值。
-- `outermostRepetitiveAncestor` 可以直接用
-  `bufferization::getEnclosingRepetitiveRegion`（`BufferizableOpInterface.h:564`）反复外推，
-  或者简化为「一路提到 func entry block」——v0 若采用 static planner 的简化版就这么做（§5.2 第三条），
-  但要保留 `hoistPoint` 的接口，别把 entry block 写死。
 
 ### 7.3 出口 gate（写成 pass 的 verifier + lit）
 
@@ -427,11 +500,28 @@ G2. 每个被提升的 slot：每层 loop 的 iter_args 里位置固定，yield 
 G3. 每个 alloc_tensor 的类型静态                                                        （V9）
 G4. bufferize 之后：循环内 memref.alloc 数 = 0，函数级 space 1 alloc 数 = slot 数        （实测 H2）
 G5. bufferize 之后额外 copy 数 = 0（只剩预期的 load/writeback）                          （实测 H2）
+G6. #alloc_tensor(输出) == #alloc_tensor(输入)，且是同一批 op（只 move）                （§7.0）
+G7. yield 回位置 j 的值是该 root 版本链的**终端** DPS result（不只是「同 root」）        （§7.2 第 2 步）
+G8. 没有任何 alloc 被提到 scf.forall / scf.while 之外                                   （§7.2.1）
 ```
 
 G4/G5 直接用现成的 lit 文件当回归：实现完成后，`hoist-only-before.mlir` 经
 `spm-opt -spm-hoist-loop-allocs` 应当逐字产出 `hoist-only-after.mlir` 的形态，
 再经 `mlir-opt -one-shot-bufferize` 得到 H2 的输出。
+
+#### 7.3.1 分析漏判的失败模式（为什么可以只做最干净的链）
+
+只实现「最简单干净的 def-use chain」之所以安全，是因为漏判基本都是**响的**：
+
+| 漏判                                                                             | 后果                                                                                                             | 谁抓住                        |
+| -------------------------------------------------------------------------------- | ---------------------------------------------------------------------------------------------------------------- | ----------------------------- |
+| destination 分叉 / 覆写后的迟到 read，且冲突那一跳是 linalg DPS op               | One-Shot 的 `insertTensorCopies` 插 copy + alloc，循环内 alloc 回来                                            | **G4**                  |
+| 同上，但冲突那一跳是 `materialize_in_destination`                              | **bufferize 直接失败**——op 的语义就是「原内容之后还要读就报错」（`BufferizationOps.td:212-216`）        | bufferize 自己，更早          |
+| alloc 被提到 `scf.forall` 之外                                                 | 静默 data race（bufferize 合法，「循环内 0 alloc」也照样成立）                                                   | 只有 **G8**，不能省     |
+| yield 了非终端 version                                                           | 静默：`%f` 与 `%mm` 是同一 buffer 的 alias，G2 的「同 root」挡不住                                           | 只有 **G7**，不能省     |
+
+所以：G4/G5 是「保守分析退化」的兜底网（配合设计文档 §7.4 的 analysis-only 自检），
+G7/G8 是必须由 pass 自己保证的两条，其余复杂场景可以先不做。
 
 ### 7.4 lit 清单（实现时补齐）
 
@@ -444,7 +534,11 @@ G4/G5 直接用现成的 lit 文件当回归：实现完成后，`hoist-only-bef
 | 待加 `hoist-basic.mlir`     | 单层 loop、1 个 slot：pass 的最小正例                                   |
 | 待加 `hoist-nested.mlir`    | 两层 loop：slot 必须提到**最外层**之外、穿两层 iter_args          |
 | 待加 `hoist-multi-op.mlir`  | 本文的 5-slot 例子：`spm-opt` 输出与 after IR 逐字比对                |
-| 待加 `hoist-partial-write.mlir` | slot 不是整块覆写 → 期望**报错**并提示按 §3.4 accumulator 处理 |
+| 待加 `hoist-partial-write.mlir` | slot 不是整块覆写 → 期望 **warning**（不是报错），提示按 §3.4 accumulator 处理 |
+| 待加 `hoist-read-fork.mlir`   | 一个 slot 被多个 `ins` 读（读分叉）→ 正例，仍然只提出 1 份              |
+| 待加 `hoist-dest-fork.mlir`   | 同一 version 被两个 DPS op 当 `outs` → 期望**报错**（§7.2.2）           |
+| 待加 `hoist-late-read.mlir`   | 中间 version 被覆写后仍被读 → 期望**报错**（§7.2.2）                    |
+| 待加 `hoist-forall.mlir`      | hoist 路径上有 `scf.forall` → 期望**报错**，绝不静默提出去（§7.2.1）    |
 | 待加 `hoist-dynamic.mlir`   | 动态类型 alloc_tensor → 期望报错（V9 应该在更早的 pass 拦住）        |
 | 待加 `hoist-space0.mlir`    | 没有 memory_space 或 space 0 的 alloc_tensor → 不动它                |
 
@@ -454,7 +548,20 @@ G4/G5 直接用现成的 lit 文件当回归：实现完成后，`hoist-only-bef
 - `slotCount = 2` 的 rotation（§5.3）；
 - `tensor.empty` 的消除（§3.6.1，必须在更早的位置跑 `-eliminate-empty-tensors`）；
 - 跨 placement 边从 `insert_slice` 规范化成 `materialize_in_destination`（§4 第 3 点）；
+- alloc 数量的最小化（同 shape、生命周期不重叠的两个 slot 共用一块物理内存）——属于 arena planner
+  （下游文档 §9），那里 memref liveness 是精确的；本 pass 一律 1:1，见 §7.0 的 G6；
+- 冗余 promote 的消除（嵌套 `extract_slice`：唯一 consumer 是同层另一次 promote）——属于
+  `MaterializeTensorStorage` 的 promote 决策 + §3.6.1 规定的 `-eliminate-empty-tensors` 次序；
 - slot 的物理连续放置（`spm.slot_group`，属于 arena planner）。
+
+### 7.6 已知保守性（记在这里，v0 不修）
+
+hoist 把 slot 的 live range 从「一次迭代内」拉长到「整个循环嵌套」。于是两个同 shape、在一次迭代内
+生命周期**不重叠**的 scratch slot，在 arena planner 眼里变成了全程并存，无法共用一块物理内存——
+要恢复这个复用，planner 需要 per-iteration liveness ＋「读前整块覆写」的判定（正是 §7.2.3 那条事实）。
+
+后果：v0 的容量核算会**高估**峰值，可能触发一次本不必要的 spill。这是保守，不是错误
+（设计文档 §4.8 的单调迭代吃得下高估），但已记入设计文档 §10 的 v0 边界表。
 
 ---
 

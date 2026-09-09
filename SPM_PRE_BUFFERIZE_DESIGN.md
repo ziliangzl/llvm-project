@@ -234,6 +234,14 @@ tile size 和 slotCount 互相依赖：tile 越大越省 traffic，但 double bu
 7. 运行 §3.5 的后置条件检查。
 ```
 
+> **第 6 步的一条实现要求**：promote 必须按 **destination use** 建 allocation，而不是按 value。
+> `promote_tensor` 用的是 `replaceAllUsesExcept`（`LinalgTransformOps.cpp:491`），一个 value 一份
+> allocation：若同一个 tile value 同时是两个 DPS op 的 `outs`（例如 `linalg.fill` 与
+> `linalg.generic` 共用一个 `outs`），就只会建出一份 allocation，在 tensor 层留下 **destination 分叉**——
+> §5.7 的 HoistOnly 只能报错，One-Shot 也只能插 copy 把它救回来（多一份循环内 alloc）。
+> 多个 op 只是**读**同一个 tile（`ins`）不受影响，共享一份 promote 是对的。
+> 见 `SPM_HOIST_ONLY_EXAMPLE.md` §7.2.2。
+
 ### 3.3 尾块规范化（必须做，有实测依据）
 
 **实测 T10**：对 `linalg.matmul` 做两级 `transform.structured.tile_using_for`（`[64,64]` 然后 `[32,32]`），
@@ -674,6 +682,15 @@ hoistPoint(a) = 紧邻 outermostRepetitiveAncestor(a) 之前
    则统一放进 entry block，但仍应尽量靠近 owning loop（下游文档 §5.5 第三条）。
 ```
 
+**`hoistPoint` 的实现必须走白名单，不能直接拿 `getEnclosingRepetitiveRegion` 反复外推。**
+该 API 把 `scf.forall` 也算成 repetitive region（`SCF/Transforms/BufferizableOpInterfaceImpl.cpp:106-113`：
+`ForallOpInterface::isRepetitiveRegion` 只看 step 数）。盲目外推会把 alloc 提到 `forall` 之外，
+**所有并发迭代共享同一份 L1 buffer = data race**，而且 bufferize 不报错、Q1 与「循环内 0 alloc」
+的判据也照样通过。§3.7 只禁止了本层 tiling 产出 `forall`，不能假设 hoist 路径上没有别人产的 `forall`。
+因此外推只跨 `scf.for` / `scf.if`；碰到 `scf.forall` / `scf.while` / 任何其他 repetitive region owner
+就停在它里面，此时若 alloc 仍在 repetitive region 内（Q1 不满足）则报错。
+算法与反例见 `SPM_HOIST_ONLY_EXAMPLE.md` §7.2.1。
+
 被提升之后，slot 必须通过**每一层** loop 的 `iter_args` 往里传。T9 实测了两层的情况：
 L1 slot 在函数顶层分配，穿过 outer loop 的 `iter_args`，再穿过两个 inner loop 的 `iter_args`。
 
@@ -831,17 +848,32 @@ T9 的 `%IA#0..3` 传给第二个 inner loop 的 `iter_args` 就是这个接线�
 
 ```text
 HoistOnly(a, L):
-  前置：a 是 L 的 loop-local allocation root，slotCount(a) == 1
-  1. 把 a 的 alloc_tensor 移到 hoistPoint(a)（§5.2）
+  前置 1：a 是 L 的 loop-local allocation root，slotCount(a) == 1
+  前置 2：a 已经存在。allocation root 由 MaterializeTensorStorage 在 §3.2 第 6 步创建；
+          本路径不创建、不删除、不合并 alloc_tensor，进出数量 1:1
+  1. 把 a 的 alloc_tensor 移到 hoistPoint(a)（§5.2，注意那里的白名单：不许跨 scf.forall）
   2. 给 L（以及所有中间层 loop）加一个 iter_arg 承载 a 的版本
-  3. body 内对 a 的第一次写改成写这个 iter_arg，最后一个版本 yield 回同一位置
-  4. 若 a 在每次迭代开始时都被完整覆写（例如先 linalg.fill 再 matmul），
-     不需要任何跨迭代内容假设；若不是完整覆写，则它其实是 accumulator（A3），按 §3.4 处理
+  3. body 内对 a 的第一次写改成写这个 iter_arg，版本链的**终端**值 yield 回同一位置
+  4. 若 a 在每次迭代开始时都被完整覆写（例如先 linalg.fill 再 matmul），不需要任何跨迭代内容假设；
+     若不是完整覆写，它大概率是 accumulator（A3，按 §3.4 处理）——但这里只 warning，不报错：
+     alloc_tensor 的内容是 undefined，把上一迭代的残留穿进来是对 UB 的合法 refine，
+     所以这一条不影响正确性，只用来探测上游的分类错误
+  5. 检查版本链线性：a 与每个中间 version 都只有一个 use，且该 use 是 DPS-init use。
+     不满足（destination 分叉 / 覆写后的迟到 read）则报错退出——这种 IR 在 tensor 层本来就需要
+     两份 buffer，正确的修法是让 MaterializeTensorStorage 按 destination use 而不是按 value promote。
+     同一个 version 被多个 op 当 ins 读（读分叉）不受影响，仍然只要一份
 ```
 
 这条路径没有 unroll、没有 prologue、没有谓词，代码体积不变。
 **大部分循环内 allocation 走的是这条路**，rotation 只用于真正需要 DMA/compute 重叠的 stream。
 T9 里的 L1 output slot 和 L2 output staging slot 就是这条路径（bufferize 后各 1 份）。
+
+因为 allocation 的份数不由本路径决定（总数由 `MaterializeTensorStorage` 按 destination 数 1:1 决定，
+每个 root 几份由 §4.6 的 `slotCount` 决定），**HoistOnly 不需要完整的 read-after-write conflict 分析**：
+它只需要沿 DPS destination chain 做一次线性性检查，复杂度 O(链长)，不需要 alias、不需要全局 liveness、
+不需要跨 root 的干涉图。真要「省 alloc」（同 shape、生命周期不重叠的 slot 共用物理内存）属于 arena
+planner（下游文档 §9），真要「少 promote」属于 `MaterializeTensorStorage`。
+完整论证、失败模式表与 lit 清单见 `SPM_HOIST_ONLY_EXAMPLE.md` §7.0 / §7.2 / §7.3.1。
 
 ### 5.8 后置条件（MaterializePipeline 出口 gate）
 
@@ -1069,6 +1101,10 @@ V14. 对每个 materialize_in_destination c：c 的 destination 在 c 之后没�
 V15. 对每个承载 slot 的 iter_arg 位置 j：yield 到位置 j 的值，其 allocation root 与
      iter_arg j 的 init 的 root 相同（R2）。
 V16. 对每个 yield tensor 的 scf.if：所有分支 yield 的值 root 相同（R3）。
+V17. 对每个承载 slot 的 iter_arg 位置 j：yield 到 j 的值是该 root 版本链的**终端** DPS result。
+     （V15 的「同 root」挡不住 yield 中间版本——fill 的 result 与 matmul 的 result root 相同。）
+V18. 每个 L1/L2 allocation root 与它的使用点之间的路径上不存在 scf.forall 或其他无序并行 region：
+     跨越它 hoist 会让并发迭代共享同一份 buffer，而 V10 和「循环内 0 alloc」都检查不出来（§5.2）。
 ```
 
 ### 7.4 建议的兜底检查
@@ -1236,6 +1272,7 @@ v0 明确支持：
 | `scf.forall` 上的流水                                    | 需要先定义并行语义下的「跨迭代预取」，v0 直接禁止（§3.7）                           |
 | 异步 DMA 的 token / wait 进入 reservation                  | 下游文档 §7.2、§9.4；本文的 slot reservation 已经按「保留到 transfer 完成」设计    |
 | 非整除尾块的 mask/predication lowering                     | §3.3 的 S2/S3，目前只定义了形态没有定义 mask op                                     |
+| 同 shape slot 的物理复用（单次迭代内生命周期不重叠）       | hoist 把 live range 拉长到整个嵌套，arena planner 需要 per-iteration liveness ＋「读前整块覆写」判定；v0 高估峰值，靠 §4.8 单调迭代兜（`SPM_HOIST_ONLY_EXAMPLE.md` §7.6） |
 | 跨 loop 的 slot 复用（顺序执行的两个 loop 共享 slot root） | §5.2 已经允许（各自在自己前面 alloc），靠 arena planner 复用 offset                 |
 
 ---
@@ -1260,7 +1297,8 @@ v0 明确支持：
  7. PlanPipeline 的 stage 分配（§4.4，照抄 Triton 的最长路径）+ §4.5 的 bail-out。
     gate：L1–L7 每条都有一个 lit 测试证明「不流水但仍然合法」。
  8. MaterializePipeline 的 HoistOnly 路径（§5.7）。这是最简单也最常用的一条。
-    gate：V10/V11 通过，且 bufferize 后循环内 0 alloc。
+    gate：V10/V11/V17/V18 通过，且 bufferize 后循环内 0 alloc；alloc_tensor 进出数量 1:1；
+          不跨 scf.forall 提升（SPM_HOIST_ONLY_EXAMPLE.md §7.3 的 G6-G8）。
  9. MaterializePipeline 的 ExpandLoop（§5.3），先只做 tailPolicy = peel。
     gate：单层的 T1e 形态，bufferize 后 alloc 数 = slot 数 + 其他，循环内 0 alloc。
 10. tailPolicy = predicate（§5.5）。
