@@ -15,11 +15,11 @@
 
 ### 0.1 目标硬件的内存层级
 
-| 层级 | 性质 |
-|---|---|
-| DRAM | 外部内存 |
-| L2 | software-managed SRAM |
-| L1 | software-managed SRAM，硬件 compute 唯一可直接读写的层 |
+| 层级 | 性质                                                   |
+| ---- | ------------------------------------------------------ |
+| DRAM | 外部内存                                               |
+| L2   | software-managed SRAM                                  |
+| L1   | software-managed SRAM，硬件 compute 唯一可直接读写的层 |
 
 三条硬件事实决定了本文的全部结构：
 
@@ -31,15 +31,15 @@ NPU 的计算架构（ISA、阵列形状、向量单元）与本文无关，不�
 
 ### 0.2 本文负责什么，不负责什么
 
-| 事项 | 归属 |
-|---|---|
-| L2 tiling / L1 tiling 的算法骨架、产出 IR、后置条件 | **本文 §3** |
-| 每个算子的 tile size 动态决策 | **外部已解决的 oracle**，本文只定义接口（§3.1） |
-| 把多个算子融进一个 tiled loop（tile-and-fuse）的融合决策 | **外部已解决的 oracle**，本文只定义接口（§3.1） |
-| software pipeline / double buffer 的完整算法 | **本文 §4、§5**（本文的重点） |
-| pre-bufferize IR 契约与 verifier | **本文 §7** |
-| One-Shot Bufferize 契约、per-space arena、静态 offset、spilling | 下游文档 §7–§9 |
-| tensor placement normal form（`alloc_tensor(memory_space)` / `materialize_in_destination`） | 下游文档 §2、§3 |
+| 事项                                                                                            | 归属                                                   |
+| ----------------------------------------------------------------------------------------------- | ------------------------------------------------------ |
+| L2 tiling / L1 tiling 的算法骨架、产出 IR、后置条件                                             | **本文 §3**                                     |
+| 每个算子的 tile size 动态决策                                                                   | **外部已解决的 oracle**，本文只定义接口（§3.1） |
+| 把多个算子融进一个 tiled loop（tile-and-fuse）的融合决策                                        | **外部已解决的 oracle**，本文只定义接口（§3.1） |
+| software pipeline / double buffer 的完整算法                                                    | **本文 §4、§5**（本文的重点）                  |
+| pre-bufferize IR 契约与 verifier                                                                | **本文 §7**                                     |
+| One-Shot Bufferize 契约、per-space arena、静态 offset、spilling                                 | 下游文档 §7–§9                                      |
+| tensor placement normal form（`alloc_tensor(memory_space)` / `materialize_in_destination`） | 下游文档 §2、§3                                      |
 
 ### 0.3 两个「已解决」的 oracle
 
@@ -65,20 +65,20 @@ FusionOracle(sliceOp, producerResult, tier) -> {fuse?, yieldProducerReplacement?
 
 ## 1. 结论速查
 
-| 问题 | 结论 | 依据 |
-|---|---|---|
-| tiling 和 pipeline 是否每层各跑一遍 | **是。** `Round(L2)` 然后 `Round(L1)` | 用户约束 |
-| pipeline 的**结构改写**是否也每层各做一遍 | **不是。** 每层只做 plan，结构展开在两层 plan 都完成后统一做一次，由内向外 | §2.3（否则 L1 slot 翻倍） |
-| v0 的 slot 表示 | **K 个独立 `alloc_tensor` root**，不是一个 ring root + K 个 `extract_slice` | §5.1，**实测** T1c/T1g 失败、T1e/T9 通过 |
-| ring（单 root + slot 维度）还能用吗 | 能，但必须把整个 ring 当一个 loop-carried tensor value 并用 `insert_slice` 写 slot；这会给跨层边引入第二种 op | §5.1，**实测** T1f |
-| 尾块 / 不整除怎么处理 | 优先 `transform.loop.peel` 让主循环静态整除；尾块 slotCount=1 不流水 | §3.3，**实测** T10 显示 stock tiling 会产生 `tensor<?x?>` |
-| 循环 trip count 必须静态吗 | **不必。** 预取可以用 `scf.if` 谓词化，且不产生额外 buffer | §5.5，**实测** T8 |
-| 能不能用 `%iv mod K` 动态选 slot | **不能。** 硬失败 | §5.1，**实测** T6 |
-| 能不能靠交换 iter_arg 位置轮转 | **不能。** 硬失败 | §5.4，**实测** T3b |
-| copy 之后能不能继续 yield 写前的版本 | **不能。** 硬失败 | §5.4，**实测** T3 |
-| 循环内 `tensor.empty` 的后果 | 变成循环内、**且 memory space 为 0** 的 `memref.alloc` | §3.6，**实测** T4 |
-| v0 用不用上游 `scf::pipelineForLoop` | **不用。** 它做 rotation 而不是 K-way unroll，slot 绑定不是静态残差 | §4.9 |
-| 「double buffer」对应 Triton 的 `num_stages` 多少 | Triton `numBuffers = stageDiff`，所以两份 buffer 对应 `num_stages=3`；本文改用 `slotCount` 做主参数 | §4.1 |
+| 问题                                               | 结论                                                                                                           | 依据                                                               |
+| -------------------------------------------------- | -------------------------------------------------------------------------------------------------------------- | ------------------------------------------------------------------ |
+| tiling 和 pipeline 是否每层各跑一遍                | **是。** `Round(L2)` 然后 `Round(L1)`                                                                | 用户约束                                                           |
+| pipeline 的**结构改写**是否也每层各做一遍    | **不是。** 每层只做 plan，结构展开在两层 plan 都完成后统一做一次，由内向外                               | §2.3（否则 L1 slot 翻倍）                                         |
+| v0 的 slot 表示                                    | **K 个独立 `alloc_tensor` root**，不是一个 ring root + K 个 `extract_slice`                          | §5.1，**实测** T1c/T1g 失败、T1e/T9 通过                    |
+| ring（单 root + slot 维度）还能用吗                | 能，但必须把整个 ring 当一个 loop-carried tensor value 并用`insert_slice` 写 slot；这会给跨层边引入第二种 op | §5.1，**实测** T1f                                          |
+| 尾块 / 不整除怎么处理                              | 优先`transform.loop.peel` 让主循环静态整除；尾块 slotCount=1 不流水                                          | §3.3，**实测** T10 显示 stock tiling 会产生 `tensor<?x?>` |
+| 循环 trip count 必须静态吗                         | **不必。** 预取可以用 `scf.if` 谓词化，且不产生额外 buffer                                             | §5.5，**实测** T8                                           |
+| 能不能用`%iv mod K` 动态选 slot                  | **不能。** 硬失败                                                                                        | §5.1，**实测** T6                                           |
+| 能不能靠交换 iter_arg 位置轮转                     | **不能。** 硬失败                                                                                        | §5.4，**实测** T3b                                          |
+| copy 之后能不能继续 yield 写前的版本               | **不能。** 硬失败                                                                                        | §5.4，**实测** T3                                           |
+| 循环内`tensor.empty` 的后果                      | 变成循环内、**且 memory space 为 0** 的 `memref.alloc`                                                 | §3.6，**实测** T4                                           |
+| v0 用不用上游`scf::pipelineForLoop`              | **不用。** 它做 rotation 而不是 K-way unroll，slot 绑定不是静态残差                                      | §4.9                                                              |
+| 「double buffer」对应 Triton 的`num_stages` 多少 | Triton`numBuffers = stageDiff`，所以两份 buffer 对应 `num_stages=3`；本文改用 `slotCount` 做主参数       | §4.1                                                              |
 
 ---
 
@@ -152,13 +152,13 @@ MaterializePipeline    在两层 plan 都冻结后，一次性由内向外展开
 
 下游文档 §6 把流程写成一条线性链。本文的两轮结构是它的细化，不是替代：
 
-| 下游文档 §6 | 本文 |
-|---|---|
-| `L2 tiling + L2 materialization intent` → `MaterializeTensorStorage(L2)` | Round(L2) 第 1–2 步，一致 |
-| `L1 tiling + L1 materialization intent` → `MaterializeTensorStorage(L1)` | Round(L1) 第 4–5 步，一致 |
-| `PlanPipeline ↔ PlanStorageAndSpills（单调迭代）` | 拆成 `PlanPipeline(L2)`（第 3 步）、`PlanPipeline(L1)`（第 6 步）和第 8 步的联合迭代。§6 的单个 `PlanPipeline` 读作「两层的 plan 之和」 |
-| `MaterializePipeline` | 第 9 步，一次，由内向外。§6 未规定展开顺序，本文规定为内→外 |
-| `VerifyTensorPlacementAndCapacity` | 第 10 步 `VerifyPreBufferizeForm`（§7）是它的可机械检查版本 |
+| 下游文档 §6                                                                  | 本文                                                                                                                                          |
+| ----------------------------------------------------------------------------- | --------------------------------------------------------------------------------------------------------------------------------------------- |
+| `L2 tiling + L2 materialization intent` → `MaterializeTensorStorage(L2)` | Round(L2) 第 1–2 步，一致                                                                                                                    |
+| `L1 tiling + L1 materialization intent` → `MaterializeTensorStorage(L1)` | Round(L1) 第 4–5 步，一致                                                                                                                    |
+| `PlanPipeline ↔ PlanStorageAndSpills（单调迭代）`                          | 拆成`PlanPipeline(L2)`（第 3 步）、`PlanPipeline(L1)`（第 6 步）和第 8 步的联合迭代。§6 的单个 `PlanPipeline` 读作「两层的 plan 之和」 |
+| `MaterializePipeline`                                                       | 第 9 步，一次，由内向外。§6 未规定展开顺序，本文规定为内→外                                                                                 |
+| `VerifyTensorPlacementAndCapacity`                                          | 第 10 步`VerifyPreBufferizeForm`（§7）是它的可机械检查版本                                                                                 |
 
 唯一的实质性差异是 `MaterializePipeline` 的**位置**：§6 把它放在两轮 tiling 之后，本文同意；
 本文额外规定它**只运行一次**、且**内层先展开**，并解释了原因（§2.3）。
@@ -315,18 +315,18 @@ P6. 循环类型是 scf.for（§3.7）。
 这张表是完备性的核心：**tiling 之后每一种会导致「循环内 allocation」的来源，都必须在这里有归属**，
 否则它会一路活到 One-Shot 变成循环内 `memref.alloc`。
 
-| # | 来源 | 归属 | 处理 |
-|---|---|---|---|
-| A1 | 每迭代换内容的输入 tile（stream） | §5.3 rotation | slotCount = 2，2-way unroll |
-| A2 | 每迭代产生的输出 tile / writeback staging | §5.3 或 §5.7 | 有跨迭代 in-flight 需求则 2，否则 1 |
-| A3 | reduction accumulator | §3.4 | 循环外 alloc + iter_arg，slotCount = 1 |
-| A4 | 融合进来的 producer 的中间结果（scratch/temp） | §5.7 | hoist-only，slotCount = 1 |
-| A5 | `linalg.fill` / DPS op 的 `tensor.empty` destination | §3.6.1 | 先 eliminate，剩下的转 `alloc_tensor` |
-| A6 | transpose / pack / layout 变换的临时 buffer | §5.7 | 同 A4 |
-| A7 | 尾块 padding buffer | §3.3 S3 | 按上界静态分配，slotCount = 1 |
-| A8 | `insertTensorCopies` 为消解 RaW 插入的 copy 的 allocation | 下游文档 §6 | 规范化成 alloc + materialize 后重新参加 §4 的 plan |
-| A9 | spill/fill 新增的 home/transit allocation | 下游文档 §7.5 | 重新参加 §4、§5（下游文档 §11 不变量 17） |
-| A10 | pipeline 自己在 prologue 里引入的 copy | §5.5 | 不新增 allocation，只写已有 slot |
+| #   | 来源                                                        | 归属           | 处理                                                |
+| --- | ----------------------------------------------------------- | -------------- | --------------------------------------------------- |
+| A1  | 每迭代换内容的输入 tile（stream）                           | §5.3 rotation | slotCount = 2，2-way unroll                         |
+| A2  | 每迭代产生的输出 tile / writeback staging                   | §5.3 或 §5.7 | 有跨迭代 in-flight 需求则 2，否则 1                 |
+| A3  | reduction accumulator                                       | §3.4          | 循环外 alloc + iter_arg，slotCount = 1              |
+| A4  | 融合进来的 producer 的中间结果（scratch/temp）              | §5.7          | hoist-only，slotCount = 1                           |
+| A5  | `linalg.fill` / DPS op 的 `tensor.empty` destination    | §3.6.1        | 先 eliminate，剩下的转`alloc_tensor`              |
+| A6  | transpose / pack / layout 变换的临时 buffer                 | §5.7          | 同 A4                                               |
+| A7  | 尾块 padding buffer                                         | §3.3 S3       | 按上界静态分配，slotCount = 1                       |
+| A8  | `insertTensorCopies` 为消解 RaW 插入的 copy 的 allocation | 下游文档 §6   | 规范化成 alloc + materialize 后重新参加 §4 的 plan |
+| A9  | spill/fill 新增的 home/transit allocation                   | 下游文档 §7.5 | 重新参加 §4、§5（下游文档 §11 不变量 17）        |
+| A10 | pipeline 自己在 prologue 里引入的 copy                      | §5.5          | 不新增 allocation，只写已有 slot                    |
 
 #### 3.6.1 `tensor.empty` 的处理次序（有实测，次序会影响正确性）
 
@@ -429,11 +429,11 @@ candidates(loop, T) =
 
 按方向再分类（方向由 source/destination root 的 space 推导，下游文档 §2.3 的表）：
 
-| 类别 | source space | dest space | 典型 |
-|---|---|---|---|
-| `in-stream` | 慢层 | T | DRAM→L2 tile load（T=L2）、L2→L1 subtile fill（T=L1） |
-| `out-stream` | T | 慢层 | L1→L2 writeback、L2→DRAM store |
-| `local` | T | T | 层内 copy，通常不值得流水 |
+| 类别           | source space | dest space | 典型                                                    |
+| -------------- | ------------ | ---------- | ------------------------------------------------------- |
+| `in-stream`  | 慢层         | T          | DRAM→L2 tile load（T=L2）、L2→L1 subtile fill（T=L1） |
+| `out-stream` | T            | 慢层       | L1→L2 writeback、L2→DRAM store                        |
+| `local`      | T            | T          | 层内 copy，通常不值得流水                               |
 
 `in-stream` 是 lookahead 的对象（提前发起）；`out-stream` 是 lagging 的对象（延后完成）。
 v0 只对 `in-stream` 做 rotation；`out-stream` 在 v0 按同步处理，slotCount 由 §4.6 计算
@@ -621,11 +621,11 @@ memref.copy %subview_3, %alloc_0                              // prologue 写到
 
 三个可行形态的实测对比：
 
-| 形态 | 实测结果 | 评价 |
-|---|---|---|
-| ring root + K 个 slice 作独立 iter_args（下游文档 §5.3 字面形态） | **失败**：多一份 alloc + 一次 copy（T1c、T1g） | 不可用 |
-| 整个 ring 作**单个** loop-carried tensor value，slot 写用 `tensor.insert_slice`，读用 `extract_slice` 取最新版本 | **通过**：2 个 alloc（ring + acc），所有 slot 访问是静态 offset 的 `memref.subview`，循环内 0 alloc、0 额外 copy（T1f） | 可用，但见下 |
-| **K 个独立 `alloc_tensor` root**，各自作 iter_arg | **通过**：K 个 alloc，循环内 0 alloc、0 额外 copy（T1e、T9） | **v0 采用** |
+| 形态                                                                                                                       | 实测结果                                                                                                                        | 评价              |
+| -------------------------------------------------------------------------------------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------- | ----------------- |
+| ring root + K 个 slice 作独立 iter_args（下游文档 §5.3 字面形态）                                                         | **失败**：多一份 alloc + 一次 copy（T1c、T1g）                                                                            | 不可用            |
+| 整个 ring 作**单个** loop-carried tensor value，slot 写用 `tensor.insert_slice`，读用 `extract_slice` 取最新版本 | **通过**：2 个 alloc（ring + acc），所有 slot 访问是静态 offset 的 `memref.subview`，循环内 0 alloc、0 额外 copy（T1f） | 可用，但见下      |
+| **K 个独立 `alloc_tensor` root**，各自作 iter_arg                                                                  | **通过**：K 个 alloc，循环内 0 alloc、0 额外 copy（T1e、T9）                                                              | **v0 采用** |
 
 选 K 个独立 root 的理由：
 
@@ -788,9 +788,9 @@ bufferize 结果：
 
 必须区分清楚两件事——这是 T6 和 T8 的差别，也是整个 v0 slot 模型的关键：
 
-| | 合法性 |
-|---|---|
-| 动态决定**往哪个 slot 写**（slot 选择依赖 iv） | **非法**，T6 硬失败 |
+|                                                                 | 合法性                          |
+| --------------------------------------------------------------- | ------------------------------- |
+| 动态决定**往哪个 slot 写**（slot 选择依赖 iv）            | **非法**，T6 硬失败       |
 | 动态决定**要不要往一个静态确定的 slot 写**（谓词化 copy） | **合法且无开销**，T8 通过 |
 
 选择建议：
@@ -1167,25 +1167,25 @@ StaticMemoryPlan（per memory space arena）下游 §9
 （`1` = L1，`2` = L2），因为 `#spm.memory_space` 尚未实现；整数与 attribute 形式对 bufferize 行为无差别。
 文件在本次会话的 scratchpad 目录下（`t*.mlir`），关键 IR 已内嵌在本文对应小节。
 
-| # | 测试内容 | 命令 | 结果 |
-|---|---|---|---|
-| T1 | 循环外 ring + 两个 slice 作 iter_args，**非流水顺序**（每个 slot 先写后读） | `-one-shot-bufferize` | 通过：2 个 alloc（ring + acc），ring 降成 2 个静态 offset（0 / 2048）的 subview，循环内 0 alloc。但这个顺序不是真实流水，见 T1c |
-| T1b | 两个独立 root，非流水顺序 | 同上 | 通过：3 个 alloc，循环内 0 alloc |
-| T1c | 循环外 ring + 两个 slice 作 iter_args，**真实流水顺序**（half A 写 pong 读 ping） + prologue | 同上 | **失败**：多出 `%alloc_0 : memref<32x64xf16,1>`，prologue 写到新 buffer |
-| T1e | **两个独立 root**，真实流水顺序 + prologue + 谓词化尾部 | 同上 | **通过**：3 个 alloc（2 slot + acc），循环内 0 alloc、0 额外 copy → **v0 采用** |
-| T1f | 整个 ring 作单个 loop-carried value，`insert_slice` 写 slot | 同上 | 通过：2 个 alloc，所有 slot 访问是静态 offset subview |
-| T1g | ring，prologue 改用 `insert_slice`，再取两个 slice 作 iter_args | 同上 | **失败**：仍多一份 alloc + 一次 copy |
-| T2 | `alloc_tensor` 在循环体内 | 同上 | 循环内 `memref.alloc() : memref<32x64xf16, 1>`（设计禁止的形态） |
-| T3 | yield 写入前的 slot 版本 | 同上 | **硬错误**：`materialize_in_destination op not bufferizable … cannot avoid RaW conflict` |
-| T3b | 交换两个 slot 的 yield 位置 | 同上 | **硬错误**：`Yield operand #0 is not equivalent to the corresponding iter bbArg` |
-| T4a | 循环内 `tensor.empty` 作 `linalg` 的 outs | 同上 | 循环内 `memref.alloc()`，且 **memory space = 0** |
-| T4b | 同上，先 `-eliminate-empty-tensors` | `-eliminate-empty-tensors` | destination 被换成 `extract_slice %arg4[...]`（外层目标的 subset，可能在 L2/DRAM） |
-| T4c | `-eliminate-empty-tensors -one-shot-bufferize` | 同上 | `memref.alloc` 数量 = **0** |
-| T6 | `scf.if` 按 `iv % 2` 在同一 ring 的两个 slice 间动态选 slot | `-one-shot-bufferize` | **硬错误**：`tensor.extract_slice op not bufferizable … cannot avoid RaW conflict` |
-| T7 | `alloc_tensor` 缺 `memory_space` | `-one-shot-bufferize="must-infer-memory-space=true"` | **硬错误**：`could not infer memory space` + `failed to bufferize op` |
-| T8 | 谓词化预取：`scf.if` then 分支 materialize、else 分支原样 yield slot | `-one-shot-bufferize` | **通过**：两分支都 yield 同一 memref，0 alloc、0 额外 copy → v0 不需要静态 trip count |
-| T9 | **两层嵌套**：L2 外层 + L1 内层各 2-way unroll，L1 slot 提到外层之外、穿过两层 iter_args，output 走 L1→L2→DRAM | 同上 | **通过**：函数顶层恰好 8 个 alloc，两个 loop body 内 0 个 alloc，19 条 copy 全部为预期搬运 |
-| T10 | 两级 `transform.structured.tile_using_for`（`[64,64]` 然后 `[32,32]`），shape 不整除 | `-transform-interpreter` | tile 类型是 `tensor<?x64xf32>` / `tensor<?x?xf32>`，内层 loop 上界为动态 `affine.min` → §3.3 的规范化是必需的 |
+| #   | 测试内容                                                                                                               | 命令                                                   | 结果                                                                                                                            |
+| --- | ---------------------------------------------------------------------------------------------------------------------- | ------------------------------------------------------ | ------------------------------------------------------------------------------------------------------------------------------- |
+| T1  | 循环外 ring + 两个 slice 作 iter_args，**非流水顺序**（每个 slot 先写后读）                                      | `-one-shot-bufferize`                                | 通过：2 个 alloc（ring + acc），ring 降成 2 个静态 offset（0 / 2048）的 subview，循环内 0 alloc。但这个顺序不是真实流水，见 T1c |
+| T1b | 两个独立 root，非流水顺序                                                                                              | 同上                                                   | 通过：3 个 alloc，循环内 0 alloc                                                                                                |
+| T1c | 循环外 ring + 两个 slice 作 iter_args，**真实流水顺序**（half A 写 pong 读 ping） + prologue                     | 同上                                                   | **失败**：多出 `%alloc_0 : memref<32x64xf16,1>`，prologue 写到新 buffer                                                 |
+| T1e | **两个独立 root**，真实流水顺序 + prologue + 谓词化尾部                                                          | 同上                                                   | **通过**：3 个 alloc（2 slot + acc），循环内 0 alloc、0 额外 copy → **v0 采用**                                    |
+| T1f | 整个 ring 作单个 loop-carried value，`insert_slice` 写 slot                                                          | 同上                                                   | 通过：2 个 alloc，所有 slot 访问是静态 offset subview                                                                           |
+| T1g | ring，prologue 改用`insert_slice`，再取两个 slice 作 iter_args                                                       | 同上                                                   | **失败**：仍多一份 alloc + 一次 copy                                                                                      |
+| T2  | `alloc_tensor` 在循环体内                                                                                            | 同上                                                   | 循环内`memref.alloc() : memref<32x64xf16, 1>`（设计禁止的形态）                                                               |
+| T3  | yield 写入前的 slot 版本                                                                                               | 同上                                                   | **硬错误**：`materialize_in_destination op not bufferizable … cannot avoid RaW conflict`                               |
+| T3b | 交换两个 slot 的 yield 位置                                                                                            | 同上                                                   | **硬错误**：`Yield operand #0 is not equivalent to the corresponding iter bbArg`                                        |
+| T4a | 循环内`tensor.empty` 作 `linalg` 的 outs                                                                           | 同上                                                   | 循环内`memref.alloc()`，且 **memory space = 0**                                                                         |
+| T4b | 同上，先`-eliminate-empty-tensors`                                                                                   | `-eliminate-empty-tensors`                           | destination 被换成`extract_slice %arg4[...]`（外层目标的 subset，可能在 L2/DRAM）                                             |
+| T4c | `-eliminate-empty-tensors -one-shot-bufferize`                                                                       | 同上                                                   | `memref.alloc` 数量 = **0**                                                                                             |
+| T6  | `scf.if` 按 `iv % 2` 在同一 ring 的两个 slice 间动态选 slot                                                        | `-one-shot-bufferize`                                | **硬错误**：`tensor.extract_slice op not bufferizable … cannot avoid RaW conflict`                                     |
+| T7  | `alloc_tensor` 缺 `memory_space`                                                                                   | `-one-shot-bufferize="must-infer-memory-space=true"` | **硬错误**：`could not infer memory space` + `failed to bufferize op`                                                 |
+| T8  | 谓词化预取：`scf.if` then 分支 materialize、else 分支原样 yield slot                                                 | `-one-shot-bufferize`                                | **通过**：两分支都 yield 同一 memref，0 alloc、0 额外 copy → v0 不需要静态 trip count                                    |
+| T9  | **两层嵌套**：L2 外层 + L1 内层各 2-way unroll，L1 slot 提到外层之外、穿过两层 iter_args，output 走 L1→L2→DRAM | 同上                                                   | **通过**：函数顶层恰好 8 个 alloc，两个 loop body 内 0 个 alloc，19 条 copy 全部为预期搬运                                |
+| T10 | 两级`transform.structured.tile_using_for`（`[64,64]` 然后 `[32,32]`），shape 不整除                              | `-transform-interpreter`                             | tile 类型是`tensor<?x64xf32>` / `tensor<?x?xf32>`，内层 loop 上界为动态 `affine.min` → §3.3 的规范化是必需的            |
 
 源码依据（本次核对过的行号，LLVM 侧为本仓库，Triton 侧为 `../triton`）：
 
@@ -1228,15 +1228,15 @@ v0 明确支持：
 
 后续再做（都不需要推翻本文的 IR 主轴）：
 
-| 后续项 | 需要改什么 |
-|---|---|
-| `lookahead > 1` / `slotCount > 2` | §4.6 的公式已经是一般式；`ExpandLoop` 的 2-way unroll 变 K-way；容量按 K 计费 |
-| 动态 `%iv mod K` 选 slot | 需要跨迭代 subset disjoint 证明；届时可直接改用上游 `scf::pipelineForLoop`（§4.9） |
-| 间接寻址 / gather 的流水 | `canPrefetch` 的 C2 放宽，参考 Triton 的 `maxIndirectionLevel` 摊薄 |
-| `scf.forall` 上的流水 | 需要先定义并行语义下的「跨迭代预取」，v0 直接禁止（§3.7） |
-| 异步 DMA 的 token / wait 进入 reservation | 下游文档 §7.2、§9.4；本文的 slot reservation 已经按「保留到 transfer 完成」设计 |
-| 非整除尾块的 mask/predication lowering | §3.3 的 S2/S3，目前只定义了形态没有定义 mask op |
-| 跨 loop 的 slot 复用（顺序执行的两个 loop 共享 slot root） | §5.2 已经允许（各自在自己前面 alloc），靠 arena planner 复用 offset |
+| 后续项                                                     | 需要改什么                                                                           |
+| ---------------------------------------------------------- | ------------------------------------------------------------------------------------ |
+| `lookahead > 1` / `slotCount > 2`                      | §4.6 的公式已经是一般式；`ExpandLoop` 的 2-way unroll 变 K-way；容量按 K 计费     |
+| 动态`%iv mod K` 选 slot                                  | 需要跨迭代 subset disjoint 证明；届时可直接改用上游`scf::pipelineForLoop`（§4.9） |
+| 间接寻址 / gather 的流水                                   | `canPrefetch` 的 C2 放宽，参考 Triton 的 `maxIndirectionLevel` 摊薄              |
+| `scf.forall` 上的流水                                    | 需要先定义并行语义下的「跨迭代预取」，v0 直接禁止（§3.7）                           |
+| 异步 DMA 的 token / wait 进入 reservation                  | 下游文档 §7.2、§9.4；本文的 slot reservation 已经按「保留到 transfer 完成」设计    |
+| 非整除尾块的 mask/predication lowering                     | §3.3 的 S2/S3，目前只定义了形态没有定义 mask op                                     |
+| 跨 loop 的 slot 复用（顺序执行的两个 loop 共享 slot root） | §5.2 已经允许（各自在自己前面 alloc），靠 arena planner 复用 offset                 |
 
 ---
 
