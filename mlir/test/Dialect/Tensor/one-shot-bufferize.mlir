@@ -77,6 +77,133 @@ func.func @unknown_insert_extract(
 
 // -----
 
+// Equivalent alias-only ops between the extraction and the read preserve the
+// subset provenance.
+
+// CHECK-LABEL: func @disjoint_extract_cast(
+//   CHECK-NOT:   memref.alloc
+//       CHECK:   memref.cast
+//   CHECK-NOT:   memref.alloc
+//       CHECK:   return
+
+// CHECK-ANALYSIS-LABEL: func @disjoint_extract_cast(
+// CHECK-ANALYSIS: tensor.insert_slice
+// CHECK-ANALYSIS-SAME: __inplace_operands_attr__ = ["true", "true"]
+func.func @disjoint_extract_cast(
+    %t: tensor<8xf32> {bufferization.writable = true},
+    %source: tensor<4xf32>) -> (tensor<8xf32>, tensor<?xf32>) {
+  %written = tensor.insert_slice %source into %t[0][4][1]
+      : tensor<4xf32> into tensor<8xf32>
+  %read = tensor.extract_slice %t[4][4][1]
+      : tensor<8xf32> to tensor<4xf32>
+  %cast = tensor.cast %read : tensor<4xf32> to tensor<?xf32>
+  return %written, %cast : tensor<8xf32>, tensor<?xf32>
+}
+
+// -----
+
+// Every possible read origin is disjoint from the written subset.
+
+// CHECK-LABEL: func @disjoint_multi_read_origins(
+//   CHECK-NOT:   memref.alloc
+//       CHECK:   arith.select
+//   CHECK-NOT:   memref.alloc
+//       CHECK:   return
+
+// CHECK-ANALYSIS-LABEL: func @disjoint_multi_read_origins(
+// CHECK-ANALYSIS: tensor.insert_slice
+// CHECK-ANALYSIS-SAME: __inplace_operands_attr__ = ["true", "true"]
+func.func @disjoint_multi_read_origins(
+    %t: tensor<12xf32> {bufferization.writable = true},
+    %source: tensor<4xf32>, %cond: i1)
+    -> (tensor<12xf32>, tensor<2xf32>) {
+  %written = tensor.insert_slice %source into %t[0][4][1]
+      : tensor<4xf32> into tensor<12xf32>
+  %read_a = tensor.extract_slice %t[8][2][1]
+      : tensor<12xf32> to tensor<2xf32>
+  %read_b = tensor.extract_slice %t[10][2][1]
+      : tensor<12xf32> to tensor<2xf32>
+  %selected = arith.select %cond, %read_a, %read_b : tensor<2xf32>
+  return %written, %selected : tensor<12xf32>, tensor<2xf32>
+}
+
+// -----
+
+// One possible read origin overlaps the written subset, so the destination
+// must remain out-of-place.
+
+// CHECK-LABEL: func @overlapping_multi_read_origins(
+//       CHECK:   %[[ALLOC:.*]] = memref.alloc
+//       CHECK:   memref.copy %{{.*}}, %[[ALLOC]]
+
+// CHECK-ANALYSIS-LABEL: func @overlapping_multi_read_origins(
+// CHECK-ANALYSIS: tensor.insert_slice
+// CHECK-ANALYSIS-SAME: __inplace_operands_attr__ = ["true", "false"]
+func.func @overlapping_multi_read_origins(
+    %t: tensor<12xf32> {bufferization.writable = true},
+    %source: tensor<4xf32>, %cond: i1)
+    -> (tensor<12xf32>, tensor<2xf32>) {
+  %written = tensor.insert_slice %source into %t[0][4][1]
+      : tensor<4xf32> into tensor<12xf32>
+  %read_a = tensor.extract_slice %t[8][2][1]
+      : tensor<12xf32> to tensor<2xf32>
+  %read_b = tensor.extract_slice %t[2][2][1]
+      : tensor<12xf32> to tensor<2xf32>
+  %selected = arith.select %cond, %read_a, %read_b : tensor<2xf32>
+  return %written, %selected : tensor<12xf32>, tensor<2xf32>
+}
+
+// -----
+
+// A non-subset leaf in the read origin set prevents a disjointness proof.
+
+// CHECK-LABEL: func @non_subset_multi_read_origin(
+//       CHECK:   %[[ALLOC:.*]] = memref.alloc
+//       CHECK:   memref.copy %{{.*}}, %[[ALLOC]]
+
+// CHECK-ANALYSIS-LABEL: func @non_subset_multi_read_origin(
+// CHECK-ANALYSIS: tensor.insert_slice
+// CHECK-ANALYSIS-SAME: __inplace_operands_attr__ = ["true", "false"]
+func.func @non_subset_multi_read_origin(
+    %t: tensor<12xf32> {bufferization.writable = true},
+    %source: tensor<4xf32>, %other: tensor<2xf32>, %cond: i1)
+    -> (tensor<12xf32>, tensor<2xf32>) {
+  %written = tensor.insert_slice %source into %t[0][4][1]
+      : tensor<4xf32> into tensor<12xf32>
+  %read = tensor.extract_slice %t[8][2][1]
+      : tensor<12xf32> to tensor<2xf32>
+  %selected = arith.select %cond, %read, %other : tensor<2xf32>
+  return %written, %selected : tensor<12xf32>, tensor<2xf32>
+}
+
+// -----
+
+// Subset reasoning works across dialects: tensor.insert_slice writes [0, 4)
+// and vector.transfer_read reads [4, 8).
+
+// CHECK-LABEL: func @disjoint_tensor_write_vector_read(
+//   CHECK-NOT:   memref.alloc
+//       CHECK:   vector.transfer_read
+//   CHECK-NOT:   memref.alloc
+//       CHECK:   return
+
+// CHECK-ANALYSIS-LABEL: func @disjoint_tensor_write_vector_read(
+// CHECK-ANALYSIS: tensor.insert_slice
+// CHECK-ANALYSIS-SAME: __inplace_operands_attr__ = ["true", "true"]
+func.func @disjoint_tensor_write_vector_read(
+    %t: tensor<8xf32> {bufferization.writable = true},
+    %source: tensor<4xf32>) -> (tensor<8xf32>, vector<4xf32>) {
+  %c4 = arith.constant 4 : index
+  %pad = arith.constant 0.0 : f32
+  %written = tensor.insert_slice %source into %t[0][4][1]
+      : tensor<4xf32> into tensor<8xf32>
+  %read = vector.transfer_read %t[%c4], %pad
+      : tensor<8xf32>, vector<4xf32>
+  return %written, %read : tensor<8xf32>, vector<4xf32>
+}
+
+// -----
+
 // CHECK-LABEL: func private @insert_slice_fun
 //  CHECK-SAME:   %[[A0:[a-zA-Z0-9]*]]: memref<?xf32, strided<[?], offset: ?>>,
 //  CHECK-SAME:   %[[A1:[a-zA-Z0-9]*]]: memref<?xf32, strided<[?], offset: ?>>,

@@ -507,6 +507,57 @@ static bool matchesInsertDestination(const AnalysisState &state,
   return llvm::all_of(backwardSlice, matchingSubset);
 }
 
+/// Find the subset extractions that the given operand may originate from.
+/// Only equivalent aliasing OpOperands are followed. If the traversal reaches
+/// any other leaf, the lookup fails.
+static FailureOr<SmallVector<SubsetOpInterface>>
+findSubsetExtractionOrigins(const AnalysisState &state, OpOperand *opOperand) {
+  auto isSubsetExtraction = [](Value value) {
+    return value.getDefiningOp<SubsetExtractionOpInterface>() != nullptr;
+  };
+
+  // A subset extraction does not itself bufferize to a memory read. Check the
+  // operand role explicitly before following its result's aliasing chain.
+  if (auto extraction =
+          dyn_cast<SubsetExtractionOpInterface>(opOperand->getOwner())) {
+    if (opOperand == &extraction.getSourceOperand())
+      return SmallVector<SubsetOpInterface>{
+          cast<SubsetOpInterface>(extraction.getOperation())};
+  }
+
+  TraversalConfig config;
+  config.followEquivalentOnly = true;
+  SetVector<Value> origins = state.findValueInReverseUseDefChain(
+      opOperand, isSubsetExtraction, config);
+
+  // `alwaysIncludeLeaves` is intentionally left at its default value. A
+  // non-equivalent edge or a non-subset leaf therefore makes the proof fail.
+  if (origins.empty() || !llvm::all_of(origins, isSubsetExtraction))
+    return failure();
+
+  SmallVector<SubsetOpInterface> subsetOrigins;
+  llvm::transform(origins, std::back_inserter(subsetOrigins), [](Value value) {
+    return cast<SubsetOpInterface>(value.getDefiningOp());
+  });
+  return subsetOrigins;
+}
+
+/// Return "true" if every pair of subsets is provably disjoint.
+static bool areAllSubsetPairsDisjoint(ArrayRef<SubsetOpInterface> lhs,
+                                      ArrayRef<SubsetOpInterface> rhs,
+                                      const AnalysisState &state) {
+  if (lhs.empty() || rhs.empty())
+    return false;
+  return llvm::all_of(lhs, [&](SubsetOpInterface lhsSubset) {
+    return llvm::all_of(rhs, [&](SubsetOpInterface rhsSubset) {
+      return lhsSubset.operatesOnDisjointSubset(
+          rhsSubset, [&](Value v1, Value v2) {
+            return state.areEquivalentBufferizedValues(v1, v2);
+          });
+    });
+  });
+}
+
 /// Return "true" if the given "read" and potentially conflicting "write" are
 /// not conflicting due to their subset relationship. The comments in this
 /// function are expressed in terms of tensor.extract_slice/tensor.insert_slice
@@ -518,41 +569,28 @@ static bool areNonConflictingSubsets(OpOperand *uRead,
   Operation *readingOp = uRead->getOwner();
   Operation *conflictingWritingOp = uConflictingWrite->getOwner();
 
-  auto subsetInsertion =
-      dyn_cast<SubsetInsertionOpInterface>(conflictingWritingOp);
-  if (subsetInsertion &&
-      uConflictingWrite == &subsetInsertion.getDestinationOperand()) {
-    auto writtenSubset = cast<SubsetOpInterface>(conflictingWritingOp);
-    auto isDisjointExtraction = [&](Value value) {
-      auto extraction = value.getDefiningOp<SubsetExtractionOpInterface>();
-      return extraction &&
-             cast<SubsetOpInterface>(extraction.getOperation())
-                 .operatesOnDisjointSubset(
-                     writtenSubset, [&](Value v1, Value v2) {
-                       return state.areEquivalentBufferizedValues(v1, v2);
-                     });
-    };
-
-    // A read from a subset does not conflict with a write to a disjoint subset
-    // of an equivalent tensor. Check the operand roles explicitly because a
-    // subset extraction does not itself bufferize to a memory read.
-    if (auto extraction = dyn_cast<SubsetExtractionOpInterface>(readingOp)) {
-      if (uRead == &extraction.getSourceOperand() &&
-          cast<SubsetOpInterface>(readingOp).operatesOnDisjointSubset(
-              writtenSubset, [&](Value v1, Value v2) {
-                return state.areEquivalentBufferizedValues(v1, v2);
-              }))
+  FailureOr<SmallVector<SubsetOpInterface>> readOrigins =
+      findSubsetExtractionOrigins(state, uRead);
+  if (succeeded(readOrigins)) {
+    // First try the exact subset written by a subset insertion op. Check the
+    // operand role explicitly: only the destination is written.
+    if (auto insertion =
+            dyn_cast<SubsetInsertionOpInterface>(conflictingWritingOp)) {
+      if (uConflictingWrite == &insertion.getDestinationOperand() &&
+          areAllSubsetPairsDisjoint(
+              *readOrigins, {cast<SubsetOpInterface>(conflictingWritingOp)},
+              state))
         return true;
     }
 
-    // The actual read may be further down the aliasing use-def chain. E.g.,
-    // tensor.extract_slice is an alias-only op and the read is attributed to a
-    // return or another consumer of its result. Trace such reads back to their
-    // subset extractions. Every origin must be a disjoint subset; a non-subset
-    // leaf or an extraction that may overlap keeps the analysis conservative.
-    SetVector<Value> readOrigins =
-        state.findValueInReverseUseDefChain(uRead, isDisjointExtraction);
-    if (!readOrigins.empty() && llvm::all_of(readOrigins, isDisjointExtraction))
+    // The write may operate on a tensor that was itself extracted from a
+    // larger tensor. In that case, use every such extraction as a conservative
+    // enclosing subset for the write. All possible read/write origin pairs
+    // must be provably disjoint.
+    FailureOr<SmallVector<SubsetOpInterface>> writeOrigins =
+        findSubsetExtractionOrigins(state, uConflictingWrite);
+    if (succeeded(writeOrigins) &&
+        areAllSubsetPairsDisjoint(*readOrigins, *writeOrigins, state))
       return true;
   }
 

@@ -119,3 +119,128 @@ func.func @unknown_transfer_read_write(
       : tensor<8xf32>, vector<4xf32>
   return %written, %read : tensor<8xf32>, vector<4xf32>
 }
+
+// -----
+
+// The write is enclosed by the lhs extraction. That extraction is disjoint
+// from the rhs extraction, so the transfer_write can bufferize in-place.
+
+// CHECK-LABEL: func @disjoint_transfer_write_extraction_provenance(
+//   CHECK-NOT:   memref.alloc
+//       CHECK:   vector.transfer_write
+//   CHECK-NOT:   memref.alloc
+//       CHECK:   return
+
+// CHECK-ANALYSIS-LABEL: func @disjoint_transfer_write_extraction_provenance(
+// CHECK-ANALYSIS: tensor.extract_slice
+// CHECK-ANALYSIS-SAME: __inplace_operands_attr__ = ["true"]
+// CHECK-ANALYSIS: vector.transfer_write
+// CHECK-ANALYSIS-SAME: __inplace_operands_attr__ = ["none", "true", "none"]
+func.func @disjoint_transfer_write_extraction_provenance(
+    %t: tensor<8xf32> {bufferization.writable = true},
+    %v: vector<4xf32>) -> (tensor<4xf32>, tensor<4xf32>) {
+  %c0 = arith.constant 0 : index
+  %lhs = tensor.extract_slice %t[0][4][1]
+      : tensor<8xf32> to tensor<4xf32>
+  %rhs = tensor.extract_slice %t[4][4][1]
+      : tensor<8xf32> to tensor<4xf32>
+  %written = vector.transfer_write %v, %lhs[%c0]
+      : vector<4xf32>, tensor<4xf32>
+  return %written, %rhs : tensor<4xf32>, tensor<4xf32>
+}
+
+// -----
+
+// The enclosing write extraction overlaps the read extraction, so the write
+// path must be separated from the original buffer.
+
+// CHECK-LABEL: func @overlapping_transfer_write_extraction_provenance(
+//       CHECK:   %[[ALLOC:.*]] = memref.alloc
+
+// CHECK-ANALYSIS-LABEL: func @overlapping_transfer_write_extraction_provenance(
+// CHECK-ANALYSIS: tensor.extract_slice
+// CHECK-ANALYSIS-SAME: __inplace_operands_attr__ = ["false"]
+// CHECK-ANALYSIS: vector.transfer_write
+// CHECK-ANALYSIS-SAME: __inplace_operands_attr__ = ["none", "true", "none"]
+func.func @overlapping_transfer_write_extraction_provenance(
+    %t: tensor<8xf32> {bufferization.writable = true},
+    %v: vector<4xf32>) -> (tensor<4xf32>, tensor<4xf32>) {
+  %c0 = arith.constant 0 : index
+  %lhs = tensor.extract_slice %t[0][4][1]
+      : tensor<8xf32> to tensor<4xf32>
+  %rhs = tensor.extract_slice %t[2][4][1]
+      : tensor<8xf32> to tensor<4xf32>
+  %written = vector.transfer_write %v, %lhs[%c0]
+      : vector<4xf32>, tensor<4xf32>
+  return %written, %rhs : tensor<4xf32>, tensor<4xf32>
+}
+
+// -----
+
+// Every possible writer origin is disjoint from the read subset.
+
+// CHECK-LABEL: func @disjoint_multi_write_origins(
+//   CHECK-NOT:   memref.alloc
+//       CHECK:   arith.select
+//   CHECK-NOT:   memref.alloc
+//       CHECK:   vector.transfer_write
+//   CHECK-NOT:   memref.alloc
+//       CHECK:   return
+
+// CHECK-ANALYSIS-LABEL: func @disjoint_multi_write_origins(
+// CHECK-ANALYSIS: tensor.extract_slice
+// CHECK-ANALYSIS-SAME: __inplace_operands_attr__ = ["true"]
+// CHECK-ANALYSIS: tensor.extract_slice
+// CHECK-ANALYSIS-SAME: __inplace_operands_attr__ = ["true"]
+// CHECK-ANALYSIS: arith.select
+// CHECK-ANALYSIS-SAME: __inplace_operands_attr__ = ["none", "true", "true"]
+// CHECK-ANALYSIS: vector.transfer_write
+// CHECK-ANALYSIS-SAME: __inplace_operands_attr__ = ["none", "true", "none"]
+func.func @disjoint_multi_write_origins(
+    %t: tensor<12xf32> {bufferization.writable = true},
+    %v: vector<2xf32>, %cond: i1) -> (tensor<2xf32>, tensor<4xf32>) {
+  %c0 = arith.constant 0 : index
+  %write_a = tensor.extract_slice %t[0][2][1]
+      : tensor<12xf32> to tensor<2xf32>
+  %write_b = tensor.extract_slice %t[2][2][1]
+      : tensor<12xf32> to tensor<2xf32>
+  %write = arith.select %cond, %write_a, %write_b : tensor<2xf32>
+  %read = tensor.extract_slice %t[8][4][1]
+      : tensor<12xf32> to tensor<4xf32>
+  %written = vector.transfer_write %v, %write[%c0]
+      : vector<2xf32>, tensor<2xf32>
+  return %written, %read : tensor<2xf32>, tensor<4xf32>
+}
+
+// -----
+
+// One possible writer origin overlaps the read subset, so the write path must
+// be separated from the original buffer.
+
+// CHECK-LABEL: func @overlapping_multi_write_origins(
+//       CHECK:   %[[ALLOC:.*]] = memref.alloc
+
+// CHECK-ANALYSIS-LABEL: func @overlapping_multi_write_origins(
+// CHECK-ANALYSIS: tensor.extract_slice
+// CHECK-ANALYSIS-SAME: __inplace_operands_attr__ = ["false"]
+// CHECK-ANALYSIS: tensor.extract_slice
+// CHECK-ANALYSIS-SAME: __inplace_operands_attr__ = ["false"]
+// CHECK-ANALYSIS: arith.select
+// CHECK-ANALYSIS-SAME: __inplace_operands_attr__ = ["none", "true", "true"]
+// CHECK-ANALYSIS: vector.transfer_write
+// CHECK-ANALYSIS-SAME: __inplace_operands_attr__ = ["none", "true", "none"]
+func.func @overlapping_multi_write_origins(
+    %t: tensor<12xf32> {bufferization.writable = true},
+    %v: vector<2xf32>, %cond: i1) -> (tensor<2xf32>, tensor<4xf32>) {
+  %c0 = arith.constant 0 : index
+  %write_a = tensor.extract_slice %t[0][2][1]
+      : tensor<12xf32> to tensor<2xf32>
+  %write_b = tensor.extract_slice %t[8][2][1]
+      : tensor<12xf32> to tensor<2xf32>
+  %write = arith.select %cond, %write_a, %write_b : tensor<2xf32>
+  %read = tensor.extract_slice %t[8][4][1]
+      : tensor<12xf32> to tensor<4xf32>
+  %written = vector.transfer_write %v, %write[%c0]
+      : vector<2xf32>, tensor<2xf32>
+  return %written, %read : tensor<2xf32>, tensor<4xf32>
+}
