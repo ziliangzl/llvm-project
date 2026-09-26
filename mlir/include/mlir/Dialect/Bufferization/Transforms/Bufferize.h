@@ -37,6 +37,10 @@ struct BufferizationStatistics {
   int64_t numBufferDealloc = 0;
   int64_t numTensorInPlace = 0;
   int64_t numTensorOutOfPlace = 0;
+  int64_t numRepetitiveRegionQueries = 0;
+  int64_t numRepetitiveRegionCacheHits = 0;
+  int64_t numRepetitiveRegionPathCacheHits = 0;
+  int64_t numRepetitiveRegionAncestorSteps = 0;
 };
 
 /// Bufferize `op` and its nested ops that implement `BufferizableOpInterface`.

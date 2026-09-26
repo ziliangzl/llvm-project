@@ -19,6 +19,7 @@
 #include "mlir/Interfaces/ControlFlowInterfaces.h"
 #include "llvm/ADT/ScopeExit.h"
 #include "llvm/ADT/SmallVectorExtras.h"
+#include "llvm/ADT/Statistic.h"
 
 //===----------------------------------------------------------------------===//
 // BufferizableOpInterface
@@ -48,59 +49,84 @@ static bool isRepetitiveRegion(Region *region,
   return false;
 }
 
+static void bumpStatistic(int64_t &statistic) {
+#if LLVM_ENABLE_STATS
+  ++statistic;
+#else
+  (void)statistic;
+#endif
+}
+
 Region *AnalysisState::getEnclosingRepetitiveRegion(
     Operation *op, const BufferizationOptions &options) {
+  bumpStatistic(statNumRepetitiveRegionQueries);
   if (!op->getBlock())
     return nullptr;
   if (auto iter = enclosingRepetitiveRegionCache.find_as(op);
-      iter != enclosingRepetitiveRegionCache.end())
+      iter != enclosingRepetitiveRegionCache.end()) {
+    bumpStatistic(statNumRepetitiveRegionCacheHits);
     return iter->second;
+  }
   return enclosingRepetitiveRegionCache[op] =
              getEnclosingRepetitiveRegion(op->getBlock(), options);
 }
 
 Region *AnalysisState::getEnclosingRepetitiveRegion(
     Value value, const BufferizationOptions &options) {
+  bumpStatistic(statNumRepetitiveRegionQueries);
   if (auto iter = enclosingRepetitiveRegionCache.find_as(value);
-      iter != enclosingRepetitiveRegionCache.end())
+      iter != enclosingRepetitiveRegionCache.end()) {
+    bumpStatistic(statNumRepetitiveRegionCacheHits);
     return iter->second;
+  }
 
-  Region *region = value.getParentRegion();
-  // Collect all visited regions since we only know the repetitive region we
-  // want to map it to later on
+  return enclosingRepetitiveRegionCache[value] =
+             getEnclosingRepetitiveRegion(value.getParentRegion(), options);
+}
+
+Region *AnalysisState::getEnclosingRepetitiveRegion(
+    Block *block, const BufferizationOptions &options) {
+  bumpStatistic(statNumRepetitiveRegionQueries);
+  if (auto iter = enclosingRepetitiveRegionCache.find_as(block);
+      iter != enclosingRepetitiveRegionCache.end()) {
+    bumpStatistic(statNumRepetitiveRegionCacheHits);
+    return iter->second;
+  }
+
+  return enclosingRepetitiveRegionCache[block] =
+             getEnclosingRepetitiveRegion(block->getParent(), options);
+}
+
+Region *AnalysisState::getEnclosingRepetitiveRegion(
+    Region *region, const BufferizationOptions &options) {
+  constexpr size_t kNumUncachedAncestorSteps = 2;
+
+  // Collect all visited regions. Once the closest repetitive region is known,
+  // map every visited region directly to it.
   SmallVector<Region *> visitedRegions;
   while (region) {
+    // For short paths, walking ancestors is cheaper than a cache lookup. Start
+    // probing only after two uncached steps.
+    if (visitedRegions.size() >= kNumUncachedAncestorSteps) {
+      if (auto iter = enclosingRepetitiveRegionPathCache.find(region);
+          iter != enclosingRepetitiveRegionPathCache.end()) {
+        bumpStatistic(statNumRepetitiveRegionCacheHits);
+        bumpStatistic(statNumRepetitiveRegionPathCacheHits);
+        region = iter->second;
+        break;
+      }
+    }
+
+    bumpStatistic(statNumRepetitiveRegionAncestorSteps);
     visitedRegions.push_back(region);
     if (isRepetitiveRegion(region, options))
       break;
     region = region->getParentRegion();
   }
-  enclosingRepetitiveRegionCache[value] = region;
-  for (Region *r : visitedRegions)
-    enclosingRepetitiveRegionCache[r] = region;
-  return region;
-}
 
-Region *AnalysisState::getEnclosingRepetitiveRegion(
-    Block *block, const BufferizationOptions &options) {
-  if (auto iter = enclosingRepetitiveRegionCache.find_as(block);
-      iter != enclosingRepetitiveRegionCache.end())
-    return iter->second;
-
-  Region *region = block->getParent();
-  Operation *op = nullptr;
-  // Collect all visited regions since we only know the repetitive region we
-  // want to map it to later on
-  SmallVector<Region *> visitedRegions;
-  do {
-    op = region->getParentOp();
-    if (isRepetitiveRegion(region, options))
-      break;
-  } while ((region = op->getParentRegion()));
-
-  enclosingRepetitiveRegionCache[block] = region;
-  for (Region *r : visitedRegions)
-    enclosingRepetitiveRegionCache[r] = region;
+  if (visitedRegions.size() > kNumUncachedAncestorSteps)
+    for (Region *visited : visitedRegions)
+      enclosingRepetitiveRegionPathCache[visited] = region;
   return region;
 }
 
@@ -119,6 +145,7 @@ bool AnalysisState::insideMutuallyExclusiveRegions(Operation *op0,
 
 void AnalysisState::resetCache() {
   enclosingRepetitiveRegionCache.clear();
+  enclosingRepetitiveRegionPathCache.clear();
   insideMutuallyExclusiveRegionsCache.clear();
 }
 

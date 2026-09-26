@@ -568,6 +568,18 @@ def OneShotBufferizePass : Pass<"one-shot-bufferize", "ModuleOp"> {
                               "Number of in-place tensor OpOperands">,
                     Statistic<"numTensorOutOfPlace", "num-tensor-out-of-place",
                               "Number of out-of-place tensor OpOperands">,
+                    Statistic<"numRepetitiveRegionQueries",
+                              "num-repetitive-region-query",
+                              "Number of enclosing repetitive region queries">,
+                    Statistic<"numRepetitiveRegionCacheHits",
+                              "num-repetitive-region-cache-hit",
+                              "Number of repetitive region cache hits">,
+                    Statistic<"numRepetitiveRegionPathCacheHits",
+                              "num-repetitive-region-path-cache-hit",
+                              "Number of repetitive region path cache hits">,
+                    Statistic<"numRepetitiveRegionAncestorSteps",
+                              "num-repetitive-region-ancestor-step",
+                              "Number of repetitive region ancestor steps">,
   ];
 
   let dependentDialects = ["bufferization::BufferizationDialect",

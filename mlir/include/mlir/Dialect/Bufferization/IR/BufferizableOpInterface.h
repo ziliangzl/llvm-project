@@ -573,6 +573,20 @@ public:
   Region *getEnclosingRepetitiveRegion(Block *block,
                                        const BufferizationOptions &options);
 
+  /// Return statistics about enclosing repetitive region queries.
+  int64_t getStatNumRepetitiveRegionQueries() const {
+    return statNumRepetitiveRegionQueries;
+  }
+  int64_t getStatNumRepetitiveRegionCacheHits() const {
+    return statNumRepetitiveRegionCacheHits;
+  }
+  int64_t getStatNumRepetitiveRegionPathCacheHits() const {
+    return statNumRepetitiveRegionPathCacheHits;
+  }
+  int64_t getStatNumRepetitiveRegionAncestorSteps() const {
+    return statNumRepetitiveRegionAncestorSteps;
+  }
+
   virtual void resetCache();
 
   /// Checks whether `op0` and `op1` are inside mutually exclusive regions.
@@ -584,6 +598,11 @@ protected:
   AnalysisState(const BufferizationOptions &options, TypeID type);
 
 private:
+  /// Return the closest enclosing repetitive region around `region`, using
+  /// cached ancestor results and path compression.
+  Region *getEnclosingRepetitiveRegion(Region *region,
+                                       const BufferizationOptions &options);
+
   /// A reference to current bufferization options.
   const BufferizationOptions &options;
 
@@ -591,8 +610,17 @@ private:
   TypeID type;
 
   /// Cache containing closest ancestor repetitive Region.
-  DenseMap<std::variant<Operation *, Block *, Region *, Value>, Region *>
+  DenseMap<std::variant<Operation *, Block *, Value>, Region *>
       enclosingRepetitiveRegionCache;
+
+  /// Cache containing closest ancestor repetitive regions for region paths.
+  DenseMap<Region *, Region *> enclosingRepetitiveRegionPathCache;
+
+  /// Statistics for the enclosing repetitive region cache.
+  int64_t statNumRepetitiveRegionQueries = 0;
+  int64_t statNumRepetitiveRegionCacheHits = 0;
+  int64_t statNumRepetitiveRegionPathCacheHits = 0;
+  int64_t statNumRepetitiveRegionAncestorSteps = 0;
 
   /// Cache that specifies whether the two operations are in mutually exclusive
   /// regions.

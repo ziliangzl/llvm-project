@@ -189,6 +189,13 @@ struct OneShotBufferizePass
     this->numBufferAlloc = statistics.numBufferAlloc;
     this->numTensorInPlace = statistics.numTensorInPlace;
     this->numTensorOutOfPlace = statistics.numTensorOutOfPlace;
+    this->numRepetitiveRegionQueries = statistics.numRepetitiveRegionQueries;
+    this->numRepetitiveRegionCacheHits =
+        statistics.numRepetitiveRegionCacheHits;
+    this->numRepetitiveRegionPathCacheHits =
+        statistics.numRepetitiveRegionPathCacheHits;
+    this->numRepetitiveRegionAncestorSteps =
+        statistics.numRepetitiveRegionAncestorSteps;
   }
 
 private:

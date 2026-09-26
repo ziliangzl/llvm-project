@@ -1624,6 +1624,14 @@ LogicalResult bufferization::analyzeOp(Operation *op,
   if (statistics) {
     statistics->numTensorInPlace = state.getStatNumTensorInPlace();
     statistics->numTensorOutOfPlace = state.getStatNumTensorOutOfPlace();
+    statistics->numRepetitiveRegionQueries =
+        state.getStatNumRepetitiveRegionQueries();
+    statistics->numRepetitiveRegionCacheHits =
+        state.getStatNumRepetitiveRegionCacheHits();
+    statistics->numRepetitiveRegionPathCacheHits =
+        state.getStatNumRepetitiveRegionPathCacheHits();
+    statistics->numRepetitiveRegionAncestorSteps =
+        state.getStatNumRepetitiveRegionAncestorSteps();
   }
 
   bool failedAnalysis = false;
